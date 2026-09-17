@@ -1,0 +1,1886 @@
+usb: add RTL8188EU USB Wi-Fi device model (usb-rtl8188eu) with a virtual station bridged to a netdev
+
+--- /dev/null	2026-09-17 07:51:14.703064162 +0200
++++ b/hw/usb/dev-rtl8188eu.c	2026-09-17 07:51:20.193062032 +0200
+@@ -0,0 +1,1861 @@
++/*
++ * Realtek RTL8188EU USB 802.11n adapter -- device model with a built-in
++ * "virtual station" that associates to the software AP run by the guest
++ * driver (rtl8188eu v5.x, e.g. hcRTOS/hccast) and bridges its data traffic
++ * to a QEMU netdev.
++ *
++ * What is modelled:
++ *  - USB 2.0 device: vendor control requests 0x05 (register read/write and
++ *    8051 firmware download), bulk OUT (TX descriptors + 802.11 frames),
++ *    bulk IN (RX descriptors + 802.11 frames, TX reports), interrupt IN.
++ *  - The MAC register file (64 KiB, byte granular) with the behaviour the
++ *    driver polls for: power-on state machine, EFUSE reads, firmware download
++ *    handshake, LLT init, H2C mailboxes, CAM polling, RF serial interface.
++ *  - A single associated station: open-system auth, association, WPA2-PSK
++ *    4-way handshake (CCMP), MAC-NAT bridging to the netdev peer.
++ *
++ * Not modelled: real crypto on the data path (the driver uses hardware
++ * encryption, so frames pass the USB boundary in the clear anyway),
++ * rate control, power save, 11n aggregation.
++ *
++ * Copyright (c) 2026 Edis Kazaz
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/timer.h"
++#include "qemu/module.h"
++#include "qemu/iov.h"
++#include "qemu/queue.h"
++#include "qemu/bswap.h"
++#include "qapi/error.h"
++#include "hw/usb.h"
++#include "hw/qdev-properties.h"
++#include "hw/qdev-properties-system.h"
++#include "net/net.h"
++#include "qom/object.h"
++#include "desc.h"
++
++#define TYPE_USB_RTL8188EU "usb-rtl8188eu"
++OBJECT_DECLARE_SIMPLE_TYPE(RTL8188EUState, USB_RTL8188EU)
++
++/* ---- Realtek MAC registers (subset) ------------------------------------ */
++#define REG_SYS_FUNC_EN         0x0002
++#define REG_APS_FSMCO           0x0004
++#define REG_9346CR              0x000A
++#define REG_RSV_CTRL            0x001C
++#define REG_EFUSE_CTRL          0x0030
++#define REG_MCUFWDL             0x0080
++#define REG_SYS_CFG             0x00F0
++#define REG_HMEBOX_E0           0x0088      /* IOL control (8051 offload) */
++#define REG_CR                  0x0100
++#define REG_PKT_BUFF_ACCESS_CTRL 0x0106
++#define REG_PKTBUF_DBG_ADDR     0x0140
++#define REG_TXPKTBUF_DBG        0x0143
++#define REG_PKTBUF_DBG_DATA_L   0x0144
++#define REG_HMETFR              0x01CC
++#define REG_LLT_INIT            0x01E0
++#define REG_TDECTRL             0x0208
++#define REG_MACID               0x0610
++#define REG_BSSID               0x0618
++#define REG_CAMCMD              0x0670
++#define REG_CAMWRITE            0x0674
++#define REG_CAMREAD             0x0678
++
++#define MCUFWDL_EN              BIT(0)
++#define MCUFWDL_RDY             BIT(1)
++#define FWDL_CHKSUM_RPT         BIT(2)
++#define WINTINI_RDY             BIT(6)
++#define RAM_DL_SEL              BIT(7)
++
++#define BOOT_FROM_EEPROM        BIT(4)
++#define EEPROM_EN               BIT(5)
++
++/* BB registers used by the RF serial interface (path A) */
++#define RFPGA0_XA_HSSIPARAMETER2 0x0824
++#define RFPGA0_XA_LSSIPARAMETER  0x0840
++#define RFPGA0_XA_LSSIREADBACK   0x08A0
++#define TRANSCEIVEA_HSPI_READBACK 0x08B8
++#define LSSI_READ_EDGE          BIT(31)
++
++#define FW_START_ADDRESS        0x1000
++#define FW_PAGE_SIZE            0x1000
++#define FW_PAGES                8
++
++/* IOL: commands the driver hands to the 8051 through the beacon queue */
++#define CMD_INIT_LLT            BIT(0)
++#define CMD_READ_EFUSE_MAP      BIT(1)
++#define CMD_EFUSE_PATCH         BIT(2)
++#define CMD_IOCONFIG            BIT(3)
++#define IOREG_CMD_WB_REG        0x04
++#define IOREG_CMD_WW_REG        0x05
++#define IOREG_CMD_WD_REG        0x06
++#define IOREG_CMD_W_RF          0x07
++#define IOREG_CMD_END           0xFF
++#define TXPKT_BUF_SELECT        0x69
++
++#define EFUSE_PHYS_LEN          512
++#define EFUSE_MAP_LEN           512
++
++#define TXDESC_SIZE             32
++#define RXDESC_SIZE             24
++
++/* ---- 802.11 ------------------------------------------------------------ */
++#define FC_TYPE_MGMT            0
++#define FC_TYPE_DATA            2
++#define FC_PROTECTED            0x4000
++#define FC_TODS                 0x0100
++#define FC_FROMDS               0x0200
++#define ST_ASSOC_REQ            0
++#define ST_ASSOC_RESP           1
++#define ST_PROBE_RESP           5
++#define ST_BEACON               8
++#define ST_DISASSOC             10
++#define ST_AUTH                 11
++#define ST_DEAUTH               12
++#define ST_DATA_NULL            4
++#define IE_SSID                 0
++#define IE_RATES                1
++#define IE_DS_PARAM             3
++#define IE_RSN                  48
++#define IE_EXT_RATES            50
++#define ETH_P_EAPOL             0x888e
++#define ETH_P_ARP               0x0806
++#define CCMP_HDR_LEN            8
++#define CCMP_MIC_LEN            8
++
++typedef enum {
++    STA_IDLE,        /* nothing heard from the AP yet */
++    STA_AUTH,        /* auth request sent */
++    STA_ASSOC,       /* assoc request sent */
++    STA_HANDSHAKE,   /* associated, waiting for EAPOL msg 1/3 */
++    STA_CONNECTED,   /* keys (if any) installed, bridging */
++} StaState;
++
++typedef struct RxFrame {
++    QSIMPLEQ_ENTRY(RxFrame) next;
++    uint32_t len;
++    uint8_t data[];
++} RxFrame;
++
++struct RTL8188EUState {
++    USBDevice dev;
++    NICConf conf;
++    NICState *nic;
++    char *psk;
++    uint32_t trace;
++
++    /* register file and memories */
++    uint8_t regs[0x10000];
++    uint8_t fwmem[FW_PAGES * FW_PAGE_SIZE];
++    uint8_t efuse[EFUSE_PHYS_LEN];
++    uint32_t rf[0x100];
++    /* beacon-queue payload (beacon or IOL command list) and the "reserved
++     * page" image the 8051 exposes through the txpktbuf debug port */
++    uint8_t bcn_buf[4096];
++    uint32_t bcn_len;
++    uint8_t iol_page[2 + EFUSE_PHYS_LEN];
++    uint32_t iol_bcnhead;
++
++    /* USB transfer state */
++    uint8_t txbuf[2][16384];
++    uint32_t txlen[2];
++    QSIMPLEQ_HEAD(, RxFrame) rxq;
++    uint32_t rxq_len;
++    RxFrame *rx_cur;
++    uint32_t rx_pos;
++    USBPacket *rx_pending;
++    bool tx_enabled;
++
++    /* virtual station */
++    StaState state;
++    uint8_t bssid[6];
++    uint8_t sta_mac[6];
++    uint8_t dev_mac[6];         /* the adapter's own (EFUSE) MAC = AP BSSID */
++    uint8_t peer_mac[6];
++    bool peer_known;
++    char ssid[33];
++    uint8_t ssid_len;
++    uint8_t ap_rsn[64];
++    uint8_t ap_rsn_len;
++    bool rsn;
++    bool keyed;
++    uint16_t seq;
++    uint16_t aid;
++    uint8_t anonce[32], snonce[32];
++    uint8_t pmk[32], ptk[64];
++    bool pmk_valid;
++    uint64_t replay;
++    QEMUTimer *timer;
++    int retries;
++    int64_t last_data_ns;
++
++    /* DHCP client: the dongle only treats a station as a "phone" once it
++     * holds a lease, so the station asks for one like a real client */
++    uint32_t dhcp_xid;
++    uint32_t lease_ip;          /* network byte order, 0 = none */
++    uint32_t dhcp_server;
++    int dhcp_tries;
++    uint32_t peer_ip;           /* last IPv4 source seen from the netdev */
++    int64_t peer_ann_ns;
++};
++
++/* ---- logging ----------------------------------------------------------- */
++#define RTL_LOG(s, lvl, ...) do {                       \
++    if ((s)->trace >= (lvl)) {                          \
++        qemu_log("rtl8188eu: " __VA_ARGS__);            \
++    }                                                   \
++} while (0)
++
++static void rtl_hexdump(RTL8188EUState *s, int lvl, const char *tag,
++                        const uint8_t *buf, size_t len)
++{
++    size_t i;
++
++    if (s->trace < lvl) {
++        return;
++    }
++    qemu_log("rtl8188eu: %s (%zu bytes):", tag, len);
++    for (i = 0; i < len && i < 96; i++) {
++        qemu_log("%s%02x", (i % 32) ? " " : "\n  ", buf[i]);
++    }
++    qemu_log("%s\n", len > 96 ? "\n  ..." : "");
++}
++
++/* ---- SHA-1 / HMAC / PBKDF2 / PRF (self-contained, no crypto backend) --- */
++typedef struct {
++    uint32_t h[5];
++    uint64_t len;
++    uint8_t buf[64];
++    size_t buflen;
++} Sha1;
++
++static inline uint32_t sha1_rol(uint32_t v, int n)
++{
++    return (v << n) | (v >> (32 - n));
++}
++
++static void sha1_block(Sha1 *c, const uint8_t *p)
++{
++    uint32_t w[80], a, b, d, e, f, k, t;
++    uint32_t cc;
++    int i;
++
++    for (i = 0; i < 16; i++) {
++        w[i] = ldl_be_p(p + 4 * i);
++    }
++    for (; i < 80; i++) {
++        w[i] = sha1_rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
++    }
++    a = c->h[0]; b = c->h[1]; cc = c->h[2]; d = c->h[3]; e = c->h[4];
++    for (i = 0; i < 80; i++) {
++        if (i < 20) {
++            f = (b & cc) | (~b & d); k = 0x5a827999;
++        } else if (i < 40) {
++            f = b ^ cc ^ d; k = 0x6ed9eba1;
++        } else if (i < 60) {
++            f = (b & cc) | (b & d) | (cc & d); k = 0x8f1bbcdc;
++        } else {
++            f = b ^ cc ^ d; k = 0xca62c1d6;
++        }
++        t = sha1_rol(a, 5) + f + e + k + w[i];
++        e = d; d = cc; cc = sha1_rol(b, 30); b = a; a = t;
++    }
++    c->h[0] += a; c->h[1] += b; c->h[2] += cc; c->h[3] += d; c->h[4] += e;
++}
++
++static void sha1_init(Sha1 *c)
++{
++    c->h[0] = 0x67452301; c->h[1] = 0xefcdab89; c->h[2] = 0x98badcfe;
++    c->h[3] = 0x10325476; c->h[4] = 0xc3d2e1f0;
++    c->len = 0;
++    c->buflen = 0;
++}
++
++static void sha1_update(Sha1 *c, const uint8_t *p, size_t n)
++{
++    c->len += n;
++    while (n) {
++        size_t take = MIN(n, 64 - c->buflen);
++
++        memcpy(c->buf + c->buflen, p, take);
++        c->buflen += take;
++        p += take;
++        n -= take;
++        if (c->buflen == 64) {
++            sha1_block(c, c->buf);
++            c->buflen = 0;
++        }
++    }
++}
++
++static void sha1_final(Sha1 *c, uint8_t out[20])
++{
++    uint8_t pad[72] = { 0x80 };
++    size_t padlen = (c->buflen < 56) ? 56 - c->buflen : 120 - c->buflen;
++    uint64_t bits = c->len * 8;
++    int i;
++
++    sha1_update(c, pad, padlen);
++    for (i = 0; i < 8; i++) {
++        pad[i] = bits >> (56 - 8 * i);
++    }
++    sha1_update(c, pad, 8);
++    for (i = 0; i < 5; i++) {
++        stl_be_p(out + 4 * i, c->h[i]);
++    }
++}
++
++static void hmac_sha1(const uint8_t *key, size_t klen, const uint8_t *msg,
++                      size_t mlen, uint8_t out[20])
++{
++    uint8_t k[64] = { 0 }, ipad[64], opad[64], inner[20];
++    Sha1 c;
++    int i;
++
++    if (klen > 64) {
++        sha1_init(&c);
++        sha1_update(&c, key, klen);
++        sha1_final(&c, k);
++    } else {
++        memcpy(k, key, klen);
++    }
++    for (i = 0; i < 64; i++) {
++        ipad[i] = k[i] ^ 0x36;
++        opad[i] = k[i] ^ 0x5c;
++    }
++    sha1_init(&c);
++    sha1_update(&c, ipad, 64);
++    sha1_update(&c, msg, mlen);
++    sha1_final(&c, inner);
++    sha1_init(&c);
++    sha1_update(&c, opad, 64);
++    sha1_update(&c, inner, 20);
++    sha1_final(&c, out);
++}
++
++static void pbkdf2_sha1(const char *pass, const uint8_t *salt, size_t slen,
++                        int iter, uint8_t *out, size_t outlen)
++{
++    uint8_t u[20], t[20], blk[64 + 4];
++    uint32_t i = 1;
++    size_t plen = strlen(pass);
++
++    while (outlen) {
++        int j, k;
++
++        memcpy(blk, salt, slen);
++        stl_be_p(blk + slen, i);
++        hmac_sha1((const uint8_t *)pass, plen, blk, slen + 4, u);
++        memcpy(t, u, 20);
++        for (j = 1; j < iter; j++) {
++            hmac_sha1((const uint8_t *)pass, plen, u, 20, u);
++            for (k = 0; k < 20; k++) {
++                t[k] ^= u[k];
++            }
++        }
++        memcpy(out, t, MIN(outlen, 20));
++        out += MIN(outlen, 20);
++        outlen -= MIN(outlen, 20);
++        i++;
++    }
++}
++
++/* IEEE 802.11 PRF-n: HMAC-SHA1(key, label || 0 || data || counter) */
++static void prf_sha1(const uint8_t *key, size_t klen, const char *label,
++                     const uint8_t *data, size_t dlen, uint8_t *out,
++                     size_t outlen)
++{
++    uint8_t buf[256], h[20];
++    size_t llen = strlen(label);
++    uint8_t ctr = 0;
++
++    while (outlen) {
++        memcpy(buf, label, llen);
++        buf[llen] = 0;
++        memcpy(buf + llen + 1, data, dlen);
++        buf[llen + 1 + dlen] = ctr++;
++        hmac_sha1(key, klen, buf, llen + 2 + dlen, h);
++        memcpy(out, h, MIN(outlen, 20));
++        out += MIN(outlen, 20);
++        outlen -= MIN(outlen, 20);
++    }
++}
++
++/* ---- EFUSE image --------------------------------------------------------- */
++static void rtl_build_efuse(RTL8188EUState *s)
++{
++    uint8_t map[EFUSE_MAP_LEN];
++    uint8_t *p = s->efuse;
++    int sec, w;
++
++    memset(map, 0xff, sizeof(map));
++    memset(s->efuse, 0xff, sizeof(s->efuse));
++    /* RTL_EEPROM_ID */
++    map[0x00] = 0x29;
++    map[0x01] = 0x81;
++    /* VID / PID / USB optional function / MAC address */
++    stw_le_p(map + 0xD0, 0x0bda);
++    stw_le_p(map + 0xD2, 0x8179);
++    map[0xD4] = 0x00;
++    memcpy(map + 0xD7, s->dev_mac, 6);
++
++    for (sec = 0; sec < EFUSE_MAP_LEN / 8; sec++) {
++        bool used = false;
++
++        for (w = 0; w < 8; w++) {
++            used |= map[sec * 8 + w] != 0xff;
++        }
++        if (!used) {
++            continue;
++        }
++        if (sec < 16) {
++            *p++ = (sec << 4) | 0x0;            /* all four words present */
++        } else {
++            *p++ = ((sec & 0x07) << 5) | 0x0f;  /* extended header */
++            *p++ = ((sec >> 3) << 4) | 0x0;
++        }
++        memcpy(p, map + sec * 8, 8);
++        p += 8;
++    }
++}
++
++/* ---- register file ------------------------------------------------------ */
++static uint32_t rtl_reg_get(RTL8188EUState *s, uint32_t addr, int size)
++{
++    uint32_t v = 0;
++    int i;
++
++    for (i = 0; i < size; i++) {
++        v |= (uint32_t)s->regs[(addr + i) & 0xffff] << (8 * i);
++    }
++    return v;
++}
++
++static void rtl_reg_set(RTL8188EUState *s, uint32_t addr, int size,
++                        uint32_t v)
++{
++    int i;
++
++    for (i = 0; i < size; i++) {
++        s->regs[(addr + i) & 0xffff] = v >> (8 * i);
++    }
++}
++
++static void rtl_efuse_read_cycle(RTL8188EUState *s)
++{
++    uint32_t ctrl = rtl_reg_get(s, REG_EFUSE_CTRL, 4);
++    uint32_t addr = (ctrl >> 8) & 0x3ff;
++    uint8_t data = addr < EFUSE_PHYS_LEN ? s->efuse[addr] : 0xff;
++
++    ctrl = (ctrl & 0x7fffff00u) | data | 0x80000000u;   /* data + ready */
++    rtl_reg_set(s, REG_EFUSE_CTRL, 4, ctrl);
++}
++
++static void rtl_write_reg(RTL8188EUState *s, uint32_t addr, const uint8_t *buf,
++                          int len);
++
++/* Execute an IOL command list (struct ioreg_cfg entries) from bcn_buf. */
++static void rtl_iol_ioconfig(RTL8188EUState *s, uint32_t page)
++{
++    uint32_t pos = page * 128;
++
++    RTL_LOG(s, 1, "iol: ioconfig from page %u (%u bytes buffered)\n", page,
++            s->bcn_len);
++    while (pos + 4 <= s->bcn_len) {
++        const uint8_t *c = s->bcn_buf + pos;
++        uint8_t len = c[0], id = c[1];
++        uint16_t address = lduw_le_p(c + 2);
++        uint32_t data, mask, cur, width;
++        uint8_t tmp[4];
++
++        if (id == IOREG_CMD_END || len < 4) {
++            break;
++        }
++        if (len < 12 || pos + 12 > s->bcn_len) {
++            break;
++        }
++        data = ldl_le_p(c + 4);
++        mask = ldl_le_p(c + 8);
++        switch (id) {
++        case IOREG_CMD_WB_REG:
++        case IOREG_CMD_WW_REG:
++        case IOREG_CMD_WD_REG:
++            width = id == IOREG_CMD_WB_REG ? 1 : (id == IOREG_CMD_WW_REG ? 2 : 4);
++            cur = rtl_reg_get(s, address, width);
++            cur = (cur & ~mask) | (data & mask);
++            stl_le_p(tmp, cur);
++            rtl_write_reg(s, address, tmp, width);
++            break;
++        case IOREG_CMD_W_RF:
++            s->rf[address & 0xff] = (s->rf[address & 0xff] & ~mask) | (data & mask);
++            break;
++        default:
++            break;                          /* delays, LLT, efuse: no-op */
++        }
++        pos += len;
++    }
++}
++
++static void rtl_iol_control(RTL8188EUState *s, uint8_t ctrl)
++{
++    if (ctrl & CMD_READ_EFUSE_MAP) {
++        /* the 8051 leaves [len16][physical map] at the beacon head page */
++        s->iol_bcnhead = s->regs[REG_TDECTRL + 1];
++        stw_le_p(s->iol_page, 2 + EFUSE_PHYS_LEN);
++        memcpy(s->iol_page + 2, s->efuse, EFUSE_PHYS_LEN);
++        RTL_LOG(s, 1, "iol: efuse map exported at page %u\n", s->iol_bcnhead);
++    }
++    if (ctrl & CMD_IOCONFIG) {
++        rtl_iol_ioconfig(s, s->regs[REG_TDECTRL + 1]);
++    }
++}
++
++/* txpktbuf debug port: 8 bytes at an 8-byte-unit address into DBG_DATA */
++static void rtl_txpktbuf_dbg_read(RTL8188EUState *s)
++{
++    uint32_t unit = rtl_reg_get(s, REG_PKTBUF_DBG_ADDR, 2) & 0x0fff;
++    uint8_t data[8] = { 0 };
++    int i;
++
++    if (s->regs[REG_PKT_BUFF_ACCESS_CTRL] == TXPKT_BUF_SELECT &&
++        unit >= s->iol_bcnhead * 16) {
++        uint32_t off = (unit - s->iol_bcnhead * 16) * 8;
++
++        for (i = 0; i < 8; i++) {
++            data[i] = off + i < sizeof(s->iol_page) ? s->iol_page[off + i] : 0xff;
++        }
++    }
++    memcpy(s->regs + REG_PKTBUF_DBG_DATA_L, data, 8);
++    s->regs[REG_TXPKTBUF_DBG] = 0xff;           /* data ready */
++}
++
++static void rtl_reg_write_byte(RTL8188EUState *s, uint32_t addr, uint8_t v)
++{
++    uint8_t old = s->regs[addr];
++
++    switch (addr) {
++    case REG_HMEBOX_E0:
++        rtl_iol_control(s, v & 0x0f);
++        v = 0;                              /* commands done, no error bits */
++        break;
++    case REG_TXPKTBUF_DBG:
++        rtl_txpktbuf_dbg_read(s);
++        return;
++    case REG_APS_FSMCO + 1:
++        /* APFM_ONMAC (bit0) / APFM_OFFMAC (bit1): state machine done at once */
++        v &= ~0x03;
++        break;
++    case REG_EFUSE_CTRL + 3:
++        s->regs[addr] = v;
++        if (!(v & 0x80)) {
++            rtl_efuse_read_cycle(s);
++        }
++        return;
++    case REG_TDECTRL + 2:
++        /* BCN_VALID (bit0) is write-1-to-clear */
++        v = (old & ~(v & 1)) | (v & ~1);
++        break;
++    case REG_LLT_INIT + 3:
++        /* LLT access completes immediately: op field back to NO_ACTIVE */
++        v &= 0x3f;
++        break;
++    case REG_CAMCMD + 3:
++        /* CAM polling bit (31) self-clears */
++        v &= 0x7f;
++        break;
++    default:
++        break;
++    }
++    s->regs[addr] = v;
++}
++
++static void rtl_write_reg(RTL8188EUState *s, uint32_t addr, const uint8_t *buf,
++                          int len)
++{
++    int i;
++
++    if (addr >= FW_START_ADDRESS && addr < FW_START_ADDRESS + FW_PAGE_SIZE) {
++        /* 8051 code download window; page select in REG_MCUFWDL+2[2:0] */
++        uint32_t page = s->regs[REG_MCUFWDL + 2] & 0x07;
++        uint32_t off = page * FW_PAGE_SIZE + (addr - FW_START_ADDRESS);
++
++        for (i = 0; i < len; i++) {
++            if (off + i < sizeof(s->fwmem)) {
++                s->fwmem[off + i] = buf[i];
++            }
++        }
++        return;
++    }
++    for (i = 0; i < len; i++) {
++        rtl_reg_write_byte(s, (addr + i) & 0xffff, buf[i]);
++    }
++    /* Side effects of complete 32-bit writes (the driver uses dword access
++     * for the baseband/RF registers). */
++    if (len == 4) {
++        uint32_t v = ldl_le_p(buf);
++
++        if (addr == RFPGA0_XA_LSSIPARAMETER) {
++            /* RF serial write: [27:20] address, [19:0] data */
++            s->rf[(v >> 20) & 0xff] = v & 0xfffff;
++        } else if (addr == RFPGA0_XA_HSSIPARAMETER2 && (v & LSSI_READ_EDGE)) {
++            /* RF serial read: [30:23] address, result in the readback regs */
++            uint32_t rfaddr = (v >> 23) & 0xff;
++
++            rtl_reg_set(s, RFPGA0_XA_LSSIREADBACK, 4, s->rf[rfaddr]);
++            rtl_reg_set(s, TRANSCEIVEA_HSPI_READBACK, 4, s->rf[rfaddr]);
++        }
++    }
++}
++
++static void rtl_read_reg(RTL8188EUState *s, uint32_t addr, uint8_t *buf,
++                         int len)
++{
++    int i;
++
++    if (addr >= FW_START_ADDRESS && addr < FW_START_ADDRESS + FW_PAGE_SIZE) {
++        uint32_t page = s->regs[REG_MCUFWDL + 2] & 0x07;
++        uint32_t off = page * FW_PAGE_SIZE + (addr - FW_START_ADDRESS);
++
++        for (i = 0; i < len; i++) {
++            buf[i] = off + i < sizeof(s->fwmem) ? s->fwmem[off + i] : 0;
++        }
++        return;
++    }
++    for (i = 0; i < len; i++) {
++        uint32_t a = (addr + i) & 0xffff;
++        uint8_t v = s->regs[a];
++
++        switch (a) {
++        case REG_APS_FSMCO + 2:
++            v |= 0x02;                      /* power ready */
++            break;
++        case REG_9346CR:
++            v = (v & ~BOOT_FROM_EEPROM) | EEPROM_EN;
++            break;
++        case REG_MCUFWDL:
++            /* checksum report is immediate; 8051 "ready" once released */
++            v |= FWDL_CHKSUM_RPT;
++            if (v & MCUFWDL_RDY) {
++                v |= WINTINI_RDY;
++            }
++            break;
++        case REG_HMETFR:
++            v = 0;                          /* all H2C boxes free */
++            break;
++        default:
++            break;
++        }
++        buf[i] = v;
++    }
++}
++
++/* ---- RX queue (device -> host) ----------------------------------------- */
++static void rtl_rx_service(RTL8188EUState *s);
++
++static void rtl_rx_enqueue(RTL8188EUState *s, const uint8_t *desc,
++                           const uint8_t *frame, uint32_t flen)
++{
++    uint32_t total = RXDESC_SIZE + flen;
++    RxFrame *f;
++
++    if (s->rxq_len > 256) {
++        RTL_LOG(s, 1, "rx queue full, dropping frame\n");
++        return;
++    }
++    /* Never end a transfer exactly on a bulk packet boundary. */
++    if ((total % 512) == 0) {
++        total += 8;
++    }
++    f = g_malloc0(sizeof(*f) + total);
++    f->len = total;
++    memcpy(f->data, desc, RXDESC_SIZE);
++    memcpy(f->data + RXDESC_SIZE, frame, flen);
++    QSIMPLEQ_INSERT_TAIL(&s->rxq, f, next);
++    s->rxq_len++;
++    rtl_rx_service(s);
++}
++
++static void rtl_rx_frame(RTL8188EUState *s, const uint8_t *frame, uint32_t len,
++                         bool protected, uint16_t seq)
++{
++    uint8_t desc[RXDESC_SIZE] = { 0 };
++    uint32_t dw0 = len & 0x3fff;
++
++    if (protected) {
++        dw0 |= 4 << 20;                     /* security = AES, HW decrypted */
++    }
++    stl_le_p(desc + 0, dw0);
++    stl_le_p(desc + 4, 0);
++    stl_le_p(desc + 8, (seq & 0xfff) | (1 << 16));      /* pkt_cnt = 1 */
++    stl_le_p(desc + 12, 0x03);                          /* rate: CCK 11M */
++    rtl_rx_enqueue(s, desc, frame, len);
++}
++
++static void rtl_rx_tx_report(RTL8188EUState *s, uint8_t macid, uint8_t sw0,
++                             uint8_t sw1, uint8_t qsel)
++{
++    uint8_t desc[RXDESC_SIZE] = { 0 };
++    uint8_t rpt[8] = { 0 };
++
++    stl_le_p(desc + 0, 8);
++    stl_le_p(desc + 8, 1 << 16);
++    stl_le_p(desc + 12, 1 << 14);                       /* rpt_sel = CCX */
++    rpt[0] = 0x80;                                      /* int_ccx */
++    rpt[1] = 0x40 | (macid & 0x3f);                     /* pkt_ok */
++    rpt[6] = (sw1 & 0x0f) | (qsel << 4);
++    rpt[7] = sw0;
++    rtl_rx_enqueue(s, desc, rpt, sizeof(rpt));
++}
++
++/* Copy the next chunk of the current RX frame into a bulk-IN packet. */
++static bool rtl_rx_fill(RTL8188EUState *s, USBPacket *p)
++{
++    uint32_t chunk;
++
++    if (!s->rx_cur) {
++        s->rx_cur = QSIMPLEQ_FIRST(&s->rxq);
++        if (!s->rx_cur) {
++            return false;
++        }
++        QSIMPLEQ_REMOVE_HEAD(&s->rxq, next);
++        s->rxq_len--;
++        s->rx_pos = 0;
++    }
++    chunk = MIN(p->iov.size, s->rx_cur->len - s->rx_pos);
++    usb_packet_copy(p, s->rx_cur->data + s->rx_pos, chunk);
++    s->rx_pos += chunk;
++    if (s->rx_pos >= s->rx_cur->len) {
++        g_free(s->rx_cur);
++        s->rx_cur = NULL;
++    }
++    return true;
++}
++
++/* Complete a bulk-IN packet that was parked with USB_RET_ASYNC. */
++static void rtl_rx_service(RTL8188EUState *s)
++{
++    USBPacket *p = s->rx_pending;
++
++    if (!p || !rtl_rx_fill(s, p)) {
++        return;
++    }
++    s->rx_pending = NULL;
++    p->status = USB_RET_SUCCESS;
++    usb_packet_complete(&s->dev, p);
++}
++
++/* ---- 802.11 frame construction (station -> AP) ------------------------- */
++static uint32_t rtl_build_hdr(RTL8188EUState *s, uint8_t *b, uint16_t fc,
++                              const uint8_t *a1, const uint8_t *a2,
++                              const uint8_t *a3)
++{
++    stw_le_p(b, fc);
++    stw_le_p(b + 2, 0);                                 /* duration */
++    memcpy(b + 4, a1, 6);
++    memcpy(b + 10, a2, 6);
++    memcpy(b + 16, a3, 6);
++    stw_le_p(b + 22, s->seq << 4);
++    return 24;
++}
++
++static void rtl_sta_send_mgmt(RTL8188EUState *s, uint8_t subtype,
++                              const uint8_t *body, uint32_t blen)
++{
++    uint8_t frame[512];
++    uint32_t n;
++
++    n = rtl_build_hdr(s, frame, (FC_TYPE_MGMT << 2) | (subtype << 4),
++                      s->bssid, s->sta_mac, s->bssid);
++    memcpy(frame + n, body, blen);
++    n += blen;
++    RTL_LOG(s, 1, "sta -> mgmt subtype %u len %u\n", subtype, n);
++    rtl_hexdump(s, 3, "sta mgmt", frame, n);
++    rtl_rx_frame(s, frame, n, false, s->seq);
++    s->seq = (s->seq + 1) & 0xfff;
++}
++
++/* LLC/SNAP-encapsulated data frame to the AP */
++static void rtl_sta_send_data(RTL8188EUState *s, const uint8_t *da,
++                              uint16_t ethertype, const uint8_t *payload,
++                              uint32_t plen)
++{
++    uint8_t frame[2048];
++    uint32_t n;
++    uint16_t fc = (FC_TYPE_DATA << 2) | FC_TODS;
++    bool prot = s->keyed && ethertype != ETH_P_EAPOL;
++
++    if (plen + 64 > sizeof(frame)) {
++        return;
++    }
++    if (prot) {
++        fc |= FC_PROTECTED;
++    }
++    n = rtl_build_hdr(s, frame, fc, s->bssid, s->sta_mac, da);
++    if (prot) {
++        /* CCMP header: PN0 PN1 rsvd keyid|ExtIV PN2..PN5 */
++        memset(frame + n, 0, CCMP_HDR_LEN);
++        frame[n] = s->seq & 0xff;
++        frame[n + 1] = s->seq >> 8;
++        frame[n + 3] = 0x20;
++        n += CCMP_HDR_LEN;
++    }
++    memcpy(frame + n, "\xaa\xaa\x03\x00\x00\x00", 6);
++    n += 6;
++    stw_be_p(frame + n, ethertype);
++    n += 2;
++    memcpy(frame + n, payload, plen);
++    n += plen;
++    if (prot) {
++        memset(frame + n, 0, CCMP_MIC_LEN);
++        n += CCMP_MIC_LEN;
++    }
++    rtl_hexdump(s, 3, "sta data", frame, n);
++    rtl_rx_frame(s, frame, n, prot, s->seq);
++    s->seq = (s->seq + 1) & 0xfff;
++}
++
++/* ---- minimal DHCP client / ARP responder for the station's own lease ---- */
++static uint16_t rtl_ip_csum(const uint8_t *p, size_t len)
++{
++    uint32_t sum = 0;
++
++    while (len > 1) {
++        sum += lduw_be_p(p);
++        p += 2;
++        len -= 2;
++    }
++    if (len) {
++        sum += p[0] << 8;
++    }
++    while (sum >> 16) {
++        sum = (sum & 0xffff) + (sum >> 16);
++    }
++    return ~sum & 0xffff;
++}
++
++static void rtl_dhcp_send(RTL8188EUState *s, uint8_t msgtype)
++{
++    static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
++    uint8_t pkt[400];
++    uint8_t *ip = pkt, *udp = pkt + 20, *bp = pkt + 28, *o;
++    uint32_t len;
++
++    memset(pkt, 0, sizeof(pkt));
++    bp[0] = 1;                                  /* BOOTREQUEST */
++    bp[1] = 1;                                  /* ethernet */
++    bp[2] = 6;
++    stl_be_p(bp + 4, s->dhcp_xid);
++    /* no broadcast flag: the AP encrypts group frames with a GTK we never
++     * negotiated, unicast replies reach us in the clear */
++    stw_be_p(bp + 10, 0x0000);
++    memcpy(bp + 28, s->sta_mac, 6);
++    memcpy(bp + 236, "\x63\x82\x53\x63", 4);
++    o = bp + 240;
++    *o++ = 53; *o++ = 1; *o++ = msgtype;
++    *o++ = 61; *o++ = 7; *o++ = 1; memcpy(o, s->sta_mac, 6); o += 6;
++    *o++ = 12; *o++ = 10; memcpy(o, "qemu-phone", 10); o += 10;
++    if (msgtype == 3) {                         /* REQUEST */
++        *o++ = 50; *o++ = 4; memcpy(o, &s->lease_ip, 4); o += 4;
++        *o++ = 54; *o++ = 4; memcpy(o, &s->dhcp_server, 4); o += 4;
++    }
++    *o++ = 55; *o++ = 3; *o++ = 1; *o++ = 3; *o++ = 6;
++    *o++ = 255;
++    len = o - pkt;
++    ip[0] = 0x45;
++    stw_be_p(ip + 2, len);
++    ip[8] = 64;
++    ip[9] = 17;
++    memset(ip + 16, 0xff, 4);                   /* dst 255.255.255.255 */
++    stw_be_p(ip + 10, rtl_ip_csum(ip, 20));
++    stw_be_p(udp + 0, 68);
++    stw_be_p(udp + 2, 67);
++    stw_be_p(udp + 4, len - 20);
++    RTL_LOG(s, 1, "dhcp: sending %s (xid 0x%08x)\n",
++            msgtype == 1 ? "DISCOVER" : "REQUEST", s->dhcp_xid);
++    rtl_sta_send_data(s, bcast, 0x0800, pkt, len);
++}
++
++static void rtl_arp_announce(RTL8188EUState *s);
++
++/* Returns true when the frame was a DHCP reply for us (consumed). */
++static bool rtl_dhcp_input(RTL8188EUState *s, const uint8_t *pl, uint32_t len)
++{
++    const uint8_t *ip = pl, *bp, *o, *end;
++    uint32_t ihl, yiaddr = 0, server = 0;
++    uint8_t type = 0;
++
++    if (len < 28 || (ip[0] >> 4) != 4 || ip[9] != 17) {
++        return false;
++    }
++    ihl = (ip[0] & 0xf) * 4;
++    if (len < ihl + 8 || lduw_be_p(ip + ihl + 2) != 68) {
++        return false;
++    }
++    bp = ip + ihl + 8;
++    end = pl + len;
++    if (bp + 240 > end || bp[0] != 2 || ldl_be_p(bp + 4) != s->dhcp_xid) {
++        return true;
++    }
++    memcpy(&yiaddr, bp + 16, 4);
++    for (o = bp + 240; o < end && *o != 255; ) {
++        if (*o == 0) {                          /* pad */
++            o++;
++            continue;
++        }
++        if (o + 2 > end || o + 2 + o[1] > end) {
++            break;
++        }
++        if (*o == 53) {
++            type = o[2];
++        } else if (*o == 54 && o[1] == 4) {
++            memcpy(&server, o + 2, 4);
++        }
++        o += 2 + o[1];
++    }
++    if (type == 2 && !s->lease_ip) {            /* OFFER */
++        s->lease_ip = yiaddr;
++        s->dhcp_server = server;
++        RTL_LOG(s, 1, "dhcp: offer %u.%u.%u.%u from %u.%u.%u.%u\n",
++                yiaddr & 0xff, (yiaddr >> 8) & 0xff, (yiaddr >> 16) & 0xff,
++                yiaddr >> 24, server & 0xff, (server >> 8) & 0xff,
++                (server >> 16) & 0xff, server >> 24);
++        rtl_dhcp_send(s, 3);
++    } else if (type == 5) {                     /* ACK */
++        s->lease_ip = yiaddr;
++        s->dhcp_tries = -1;                     /* bound */
++        RTL_LOG(s, 1, "dhcp: bound to %u.%u.%u.%u\n", yiaddr & 0xff,
++                (yiaddr >> 8) & 0xff, (yiaddr >> 16) & 0xff, yiaddr >> 24);
++        rtl_arp_announce(s);
++    } else if (type == 6) {                     /* NAK */
++        s->lease_ip = 0;
++    }
++    return true;
++}
++
++/* Answer ARP requests for the leased address on behalf of the station. */
++static bool rtl_arp_input(RTL8188EUState *s, const uint8_t *arp, uint32_t len)
++{
++    uint8_t reply[28];
++
++    if (len < 28 || !s->lease_ip || lduw_be_p(arp + 6) != 1 ||
++        memcmp(arp + 24, &s->lease_ip, 4)) {
++        return false;
++    }
++    memcpy(reply, arp, 8);
++    stw_be_p(reply + 6, 2);                     /* reply */
++    memcpy(reply + 8, s->sta_mac, 6);
++    memcpy(reply + 14, &s->lease_ip, 4);
++    memcpy(reply + 18, arp + 8, 10);            /* target = requester */
++    rtl_sta_send_data(s, arp + 8, ETH_P_ARP, reply, sizeof(reply));
++    return true;
++}
++
++/* Unicast ARP request for the gateway: lwIP inserts the requester into its
++ * ARP table, so the dongle learns the station's leased address without
++ * ever having to broadcast (which we could not decrypt). */
++static void rtl_arp_announce(RTL8188EUState *s)
++{
++    uint8_t arp[28];
++
++    if (!s->lease_ip || !s->dhcp_server) {
++        return;
++    }
++    stw_be_p(arp + 0, 1);                       /* ethernet */
++    stw_be_p(arp + 2, 0x0800);
++    arp[4] = 6;
++    arp[5] = 4;
++    stw_be_p(arp + 6, 1);                       /* request */
++    memcpy(arp + 8, s->sta_mac, 6);
++    memcpy(arp + 14, &s->lease_ip, 4);
++    memset(arp + 18, 0, 6);
++    memcpy(arp + 24, &s->dhcp_server, 4);
++    rtl_sta_send_data(s, s->bssid, ETH_P_ARP, arp, sizeof(arp));
++}
++
++/*
++ * The AP's own ARP requests are group-addressed and therefore encrypted with
++ * a key the station never negotiated, so the dongle can only learn the
++ * netdev peer's address from a request *we* send: a unicast ARP request on
++ * the peer's behalf makes lwIP insert (peer_ip -> station MAC).
++ */
++static void rtl_peer_announce(RTL8188EUState *s, uint32_t src_ip,
++                              uint32_t dst_ip)
++{
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    uint8_t arp[28];
++
++    if (!src_ip || dst_ip == 0xffffffffu) {
++        return;
++    }
++    if (src_ip == s->peer_ip && now - s->peer_ann_ns < 20 * NANOSECONDS_PER_SECOND) {
++        return;
++    }
++    s->peer_ip = src_ip;
++    s->peer_ann_ns = now;
++    stw_be_p(arp + 0, 1);
++    stw_be_p(arp + 2, 0x0800);
++    arp[4] = 6;
++    arp[5] = 4;
++    stw_be_p(arp + 6, 1);
++    memcpy(arp + 8, s->sta_mac, 6);
++    memcpy(arp + 14, &src_ip, 4);
++    memset(arp + 18, 0, 6);
++    memcpy(arp + 24, &dst_ip, 4);
++    RTL_LOG(s, 2, "arp: teaching the AP %u.%u.%u.%u -> station\n",
++            src_ip & 0xff, (src_ip >> 8) & 0xff, (src_ip >> 16) & 0xff,
++            src_ip >> 24);
++    rtl_sta_send_data(s, s->bssid, ETH_P_ARP, arp, sizeof(arp));
++}
++
++static void rtl_dhcp_kick(RTL8188EUState *s)
++{
++    if (s->dhcp_tries < 0) {
++        rtl_arp_announce(s);                    /* bound: keep the entry warm */
++        return;
++    }
++    if (s->dhcp_tries > 8) {
++        return;
++    }
++    if (s->dhcp_tries == 0) {
++        s->dhcp_xid = g_random_int();
++    }
++    s->dhcp_tries++;
++    s->lease_ip = 0;
++    rtl_dhcp_send(s, 1);
++}
++
++static void rtl_sta_send_null(RTL8188EUState *s)
++{
++    uint8_t frame[32];
++    uint32_t n;
++
++    n = rtl_build_hdr(s, frame, (FC_TYPE_DATA << 2) | (ST_DATA_NULL << 4) |
++                      FC_TODS, s->bssid, s->sta_mac, s->bssid);
++    rtl_rx_frame(s, frame, n, false, s->seq);
++    s->seq = (s->seq + 1) & 0xfff;
++}
++
++static void rtl_sta_auth(RTL8188EUState *s)
++{
++    uint8_t body[6];
++
++    stw_le_p(body, 0);          /* open system */
++    stw_le_p(body + 2, 1);      /* sequence 1 */
++    stw_le_p(body + 4, 0);      /* status */
++    s->state = STA_AUTH;
++    rtl_sta_send_mgmt(s, ST_AUTH, body, sizeof(body));
++}
++
++/* Our RSN IE: version 1, the AP's group cipher, CCMP pairwise, PSK AKM. */
++static uint32_t rtl_build_rsn_ie(RTL8188EUState *s, uint8_t *ie)
++{
++    ie[0] = IE_RSN;
++    ie[1] = 20;
++    stw_le_p(ie + 2, 1);
++    memcpy(ie + 4, s->ap_rsn + 4, 4);
++    stw_le_p(ie + 8, 1);
++    memcpy(ie + 10, "\x00\x0f\xac\x04", 4);
++    stw_le_p(ie + 14, 1);
++    memcpy(ie + 16, "\x00\x0f\xac\x02", 4);
++    stw_le_p(ie + 20, 0);
++    return 22;
++}
++
++static void rtl_sta_assoc(RTL8188EUState *s)
++{
++    uint8_t body[256];
++    uint32_t n = 0;
++    static const uint8_t rates[8] = { 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12,
++                                      0x18, 0x24 };
++    static const uint8_t xrates[4] = { 0x30, 0x48, 0x60, 0x6c };
++
++    stw_le_p(body + n, 0x0021 | (s->rsn ? 0x0010 : 0));   /* ESS, short pre */
++    n += 2;
++    stw_le_p(body + n, 10);                                /* listen interval */
++    n += 2;
++    body[n++] = IE_SSID;
++    body[n++] = s->ssid_len;
++    memcpy(body + n, s->ssid, s->ssid_len);
++    n += s->ssid_len;
++    body[n++] = IE_RATES;
++    body[n++] = sizeof(rates);
++    memcpy(body + n, rates, sizeof(rates));
++    n += sizeof(rates);
++    body[n++] = IE_EXT_RATES;
++    body[n++] = sizeof(xrates);
++    memcpy(body + n, xrates, sizeof(xrates));
++    n += sizeof(xrates);
++    if (s->rsn) {
++        n += rtl_build_rsn_ie(s, body + n);
++    }
++    s->state = STA_ASSOC;
++    rtl_sta_send_mgmt(s, ST_ASSOC_REQ, body, n);
++}
++
++static void rtl_sta_timer(void *opaque)
++{
++    RTL8188EUState *s = opaque;
++
++    switch (s->state) {
++    case STA_AUTH:
++    case STA_ASSOC:
++    case STA_HANDSHAKE:
++        if (++s->retries > 5) {
++            RTL_LOG(s, 1, "sta: giving up in state %d, restarting\n", s->state);
++            s->state = STA_IDLE;
++            s->keyed = false;
++            return;
++        }
++        if (s->state == STA_AUTH) {
++            rtl_sta_auth(s);
++        } else if (s->state == STA_ASSOC) {
++            rtl_sta_assoc(s);
++        }
++        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                  NANOSECONDS_PER_SECOND);
++        break;
++    case STA_CONNECTED:
++        /* keep the AP's inactivity timer happy; retry DHCP until bound */
++        rtl_sta_send_null(s);
++        rtl_dhcp_kick(s);
++        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                  (s->dhcp_tries < 0 ? 10 : 3) * NANOSECONDS_PER_SECOND);
++        break;
++    default:
++        break;
++    }
++}
++
++static void rtl_sta_arm(RTL8188EUState *s, int64_t ms)
++{
++    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++              ms * SCALE_MS);
++}
++
++/* ---- WPA2-PSK supplicant ----------------------------------------------- */
++static void rtl_derive_ptk(RTL8188EUState *s)
++{
++    uint8_t data[76];
++    const uint8_t *lo, *hi;
++
++    if (!s->pmk_valid) {
++        pbkdf2_sha1(s->psk, (const uint8_t *)s->ssid, s->ssid_len, 4096,
++                    s->pmk, 32);
++        s->pmk_valid = true;
++    }
++    if (memcmp(s->bssid, s->sta_mac, 6) < 0) {
++        memcpy(data, s->bssid, 6);
++        memcpy(data + 6, s->sta_mac, 6);
++    } else {
++        memcpy(data, s->sta_mac, 6);
++        memcpy(data + 6, s->bssid, 6);
++    }
++    if (memcmp(s->anonce, s->snonce, 32) < 0) {
++        lo = s->anonce; hi = s->snonce;
++    } else {
++        lo = s->snonce; hi = s->anonce;
++    }
++    memcpy(data + 12, lo, 32);
++    memcpy(data + 44, hi, 32);
++    prf_sha1(s->pmk, 32, "Pairwise key expansion", data, sizeof(data),
++             s->ptk, 64);
++}
++
++static void rtl_sta_eapol(RTL8188EUState *s, const uint8_t *pkt, uint32_t len)
++{
++    uint16_t key_info, reply_info;
++    uint8_t out[256], mic[20];
++    uint32_t n, kdlen = 0;
++    bool pairwise, ack, secure, has_mic;
++
++    /* 802.1X header (4) + descriptor type (1) + key info (2) ... */
++    if (len < 99 || pkt[1] != 3) {
++        return;
++    }
++    key_info = lduw_be_p(pkt + 5);
++    pairwise = key_info & 0x0008;
++    has_mic = key_info & 0x0100;
++    ack = key_info & 0x0080;
++    secure = key_info & 0x0200;
++    if (!ack) {
++        return;                     /* not a message we must answer */
++    }
++    RTL_LOG(s, 1, "eapol-key from AP: info=0x%04x (%s%s%s)\n", key_info,
++            pairwise ? "pairwise " : "group ", has_mic ? "mic " : "",
++            secure ? "secure" : "");
++    memcpy(&s->replay, pkt + 9, 8);
++
++    if (pairwise && !has_mic) {
++        /* message 1: ANonce -> derive PTK, answer with SNonce + RSN IE */
++        int i;
++
++        memcpy(s->anonce, pkt + 17, 32);
++        for (i = 0; i < 32; i++) {
++            s->snonce[i] = g_random_int() & 0xff;
++        }
++        rtl_derive_ptk(s);
++        reply_info = (key_info & 0x0007) | 0x0008 | 0x0100;
++        kdlen = s->ap_rsn_len;
++    } else if (pairwise) {
++        /* message 3 */
++        reply_info = (key_info & 0x0007) | 0x0008 | 0x0100 | 0x0200;
++    } else {
++        /* group key handshake message 1 */
++        reply_info = (key_info & 0x0007) | 0x0100 | 0x0200;
++    }
++
++    /*
++     * EAPOL-Key layout: 0 version, 1 type, 2 length, 4 descriptor type,
++     * 5 key info, 7 key length, 9 replay counter, 17 nonce, 49 IV, 65 RSC,
++     * 73 ID, 81 MIC, 97 key data length, 99 key data.
++     */
++    memset(out, 0, sizeof(out));
++    out[0] = 2;                                 /* 802.1X version */
++    out[1] = 3;                                 /* EAPOL-Key */
++    stw_be_p(out + 2, 95 + kdlen);
++    out[4] = 2;                                 /* RSN key descriptor */
++    stw_be_p(out + 5, reply_info);
++    stw_be_p(out + 7, 0);                       /* key length */
++    memcpy(out + 9, pkt + 9, 8);                /* replay counter */
++    if (pairwise && !has_mic) {
++        memcpy(out + 17, s->snonce, 32);
++    }
++    stw_be_p(out + 97, kdlen);
++    if (kdlen) {
++        kdlen = rtl_build_rsn_ie(s, out + 99);
++        stw_be_p(out + 2, 95 + kdlen);
++        stw_be_p(out + 97, kdlen);
++    }
++    n = 99 + kdlen;
++    if ((key_info & 0x0007) != 2) {
++        RTL_LOG(s, 1, "warning: key descriptor version %u, MIC will be wrong\n",
++                key_info & 0x0007);
++    }
++    /* MIC = HMAC-SHA1(KCK, frame)[0:16] (key descriptor version 2) */
++    hmac_sha1(s->ptk, 16, out, n, mic);
++    memcpy(out + 81, mic, 16);
++    rtl_sta_send_data(s, s->bssid, ETH_P_EAPOL, out, n);
++
++    if (pairwise && has_mic) {
++        s->keyed = s->rsn;
++        s->state = STA_CONNECTED;
++        s->retries = 0;
++        RTL_LOG(s, 1, "sta: 4-way handshake done, link up (%s)\n",
++                s->keyed ? "CCMP" : "open");
++        s->dhcp_tries = 0;
++        rtl_sta_arm(s, 500);
++    }
++}
++
++/* ---- frames from the AP (guest driver TX path) ------------------------- */
++static const uint8_t *rtl_find_ie(const uint8_t *ies, uint32_t len, uint8_t id)
++{
++    while (len >= 2) {
++        if (ies[0] == id) {
++            return ies[1] + 2 <= len ? ies : NULL;
++        }
++        if ((uint32_t)ies[1] + 2 > len) {
++            return NULL;
++        }
++        len -= ies[1] + 2;
++        ies += ies[1] + 2;
++    }
++    return NULL;
++}
++
++static void rtl_ap_beacon(RTL8188EUState *s, const uint8_t *f, uint32_t len)
++{
++    const uint8_t *ies = f + 24 + 12;
++    const uint8_t *ie;
++    uint32_t ilen;
++
++    if (len < 36) {
++        return;
++    }
++    ilen = len - 36;
++    ie = rtl_find_ie(ies, ilen, IE_SSID);
++    if (!ie || ie[1] == 0 || ie[1] > 32) {
++        return;
++    }
++    if (s->state != STA_IDLE) {
++        return;
++    }
++    if (s->trace >= 2) {
++        const uint8_t *p = ies;
++        uint32_t left = ilen;
++
++        qemu_log("rtl8188eu: beacon IEs:");
++        while (left >= 2 && p[1] + 2 <= left) {
++            qemu_log(" %02x(%u)", p[0], p[1]);
++            left -= p[1] + 2;
++            p += p[1] + 2;
++        }
++        qemu_log("\n");
++    }
++    memcpy(s->bssid, f + 16, 6);
++    memcpy(s->ssid, ie + 2, ie[1]);
++    s->ssid[ie[1]] = 0;
++    s->ssid_len = ie[1];
++    s->pmk_valid = false;
++    ie = rtl_find_ie(ies, ilen, IE_RSN);
++    if (ie && ie[1] + 2 <= sizeof(s->ap_rsn)) {
++        memcpy(s->ap_rsn, ie, ie[1] + 2);
++        s->ap_rsn_len = ie[1] + 2;
++        s->rsn = true;
++    } else {
++        s->rsn = false;
++        s->ap_rsn_len = 0;
++    }
++    RTL_LOG(s, 1, "beacon: bssid %02x:%02x:%02x:%02x:%02x:%02x ssid '%s' %s"
++            " -> associating as %02x:%02x:%02x:%02x:%02x:%02x\n",
++            s->bssid[0], s->bssid[1], s->bssid[2], s->bssid[3], s->bssid[4],
++            s->bssid[5], s->ssid, s->rsn ? "WPA2" : "open",
++            s->sta_mac[0], s->sta_mac[1], s->sta_mac[2], s->sta_mac[3],
++            s->sta_mac[4], s->sta_mac[5]);
++    s->retries = 0;
++    s->keyed = false;
++    rtl_sta_auth(s);
++    rtl_sta_arm(s, 1000);
++}
++
++static void rtl_ap_mgmt(RTL8188EUState *s, const uint8_t *f, uint32_t len,
++                        uint8_t subtype)
++{
++    uint16_t status;
++
++    switch (subtype) {
++    case ST_BEACON:
++    case ST_PROBE_RESP:
++        rtl_ap_beacon(s, f, len);
++        break;
++    case ST_AUTH:
++        if (len < 30 || memcmp(f + 4, s->sta_mac, 6)) {
++            return;
++        }
++        status = lduw_le_p(f + 28);
++        RTL_LOG(s, 1, "auth response: seq %u status %u\n",
++                lduw_le_p(f + 26), status);
++        if (s->state == STA_AUTH && status == 0) {
++            s->retries = 0;
++            rtl_sta_assoc(s);
++            rtl_sta_arm(s, 1000);
++        }
++        break;
++    case ST_ASSOC_RESP:
++        if (len < 30 || memcmp(f + 4, s->sta_mac, 6)) {
++            return;
++        }
++        status = lduw_le_p(f + 26);
++        s->aid = lduw_le_p(f + 28) & 0x3fff;
++        RTL_LOG(s, 1, "assoc response: status %u aid %u\n", status, s->aid);
++        if (s->state == STA_ASSOC && status == 0) {
++            s->retries = 0;
++            if (s->rsn) {
++                s->state = STA_HANDSHAKE;
++                rtl_sta_arm(s, 3000);
++            } else {
++                s->state = STA_CONNECTED;
++                s->keyed = false;
++                RTL_LOG(s, 1, "sta: associated to open AP, link up\n");
++                s->dhcp_tries = 0;
++                rtl_sta_arm(s, 500);
++            }
++        }
++        break;
++    case ST_DEAUTH:
++    case ST_DISASSOC:
++        if (memcmp(f + 4, s->sta_mac, 6) && memcmp(f + 4, "\xff\xff\xff\xff\xff\xff", 6)) {
++            return;
++        }
++        RTL_LOG(s, 1, "deauth/disassoc from AP (reason %u), re-associating\n",
++                len >= 26 ? lduw_le_p(f + 24) : 0);
++        s->state = STA_IDLE;
++        s->keyed = false;
++        break;
++    default:
++        break;
++    }
++}
++
++/* MAC NAT: the single netdev peer appears to the AP as the station itself. */
++static void rtl_nat_out(RTL8188EUState *s, uint8_t *eth, uint32_t len)
++{
++    if (!s->peer_known) {
++        return;
++    }
++    if (!memcmp(eth, s->sta_mac, 6)) {
++        memcpy(eth, s->peer_mac, 6);
++    }
++    if (len >= 42 && lduw_be_p(eth + 12) == ETH_P_ARP &&
++        !memcmp(eth + 32, s->sta_mac, 6)) {
++        memcpy(eth + 32, s->peer_mac, 6);           /* target hw address */
++    }
++}
++
++static void rtl_ap_data(RTL8188EUState *s, const uint8_t *f, uint32_t len)
++{
++    uint16_t fc = lduw_le_p(f);
++    uint32_t hdr = 24, ethertype;
++    uint8_t eth[2048];
++    const uint8_t *da, *sa;
++    uint32_t plen;
++
++    if ((fc & 0x00f0) & 0x0040) {           /* null / no-data subtypes */
++        return;
++    }
++    if (fc & 0x0080) {                      /* QoS data */
++        hdr += 2;
++    }
++    if (fc & FC_PROTECTED) {
++        hdr += CCMP_HDR_LEN;                /* hardware would encrypt */
++    }
++    if (len < hdr + 8) {
++        return;
++    }
++    da = f + 4;                             /* FromDS: addr1 = DA */
++    sa = f + 16;                            /* addr3 = SA */
++    if (!(fc & FC_FROMDS)) {
++        return;
++    }
++    if (memcmp(da, s->sta_mac, 6) && !(da[0] & 1)) {
++        return;                             /* not for our station */
++    }
++    if (memcmp(f + hdr, "\xaa\xaa\x03\x00\x00\x00", 6)) {
++        return;                             /* not LLC/SNAP encapsulated */
++    }
++    ethertype = lduw_be_p(f + hdr + 6);
++    plen = len - hdr - 8;
++    if (ethertype == ETH_P_EAPOL) {
++        rtl_sta_eapol(s, f + hdr + 8, plen);
++        return;
++    }
++    if (s->state != STA_CONNECTED || plen + 14 > sizeof(eth)) {
++        return;
++    }
++    if (ethertype == 0x0800 && rtl_dhcp_input(s, f + hdr + 8, plen)) {
++        return;                             /* our own DHCP exchange */
++    }
++    if (ethertype == ETH_P_ARP && rtl_arp_input(s, f + hdr + 8, plen)) {
++        /* answered for the leased address; still let the peer see it */
++    }
++    memcpy(eth, da, 6);
++    memcpy(eth + 6, sa, 6);
++    stw_be_p(eth + 12, ethertype);
++    memcpy(eth + 14, f + hdr + 8, plen);
++    rtl_nat_out(s, eth, plen + 14);
++    rtl_hexdump(s, 3, "to netdev", eth, plen + 14);
++    qemu_send_packet(qemu_get_queue(s->nic), eth, plen + 14);
++}
++
++static void rtl_handle_tx_frame(RTL8188EUState *s, const uint8_t *f,
++                                uint32_t len, uint32_t qsel)
++{
++    uint16_t fc;
++    uint8_t type, subtype;
++
++    if (len < 24) {
++        return;
++    }
++    fc = lduw_le_p(f);
++    type = (fc >> 2) & 3;
++    subtype = (fc >> 4) & 0xf;
++    RTL_LOG(s, 2, "ap tx: qsel 0x%02x type %u subtype %u len %u\n", qsel, type,
++            subtype, len);
++    rtl_hexdump(s, 3, "ap tx", f, len);
++    if (qsel == 0x10) {
++        /* beacon queue: hardware latches it (BCN_VALID); it is also how
++         * IOL command lists reach the 8051 */
++        s->regs[REG_TDECTRL + 2] |= 1;
++        s->bcn_len = MIN(len, sizeof(s->bcn_buf));
++        memcpy(s->bcn_buf, f, s->bcn_len);
++    }
++    if (type == FC_TYPE_MGMT) {
++        rtl_ap_mgmt(s, f, len, subtype);
++    } else if (type == FC_TYPE_DATA) {
++        rtl_ap_data(s, f, len);
++    }
++}
++
++/*
++ * Bulk OUT stream: [txdesc][pad][frame] units, 8-byte aligned.  The host
++ * controller may pack a whole transfer into one oversized packet or split
++ * it arbitrarily, so the stream is delimited by the descriptors themselves:
++ * consume every complete unit, keep a partial one for the next packet.
++ */
++static void rtl_tx_drain(RTL8188EUState *s, int idx)
++{
++    uint8_t *buf = s->txbuf[idx];
++    uint32_t len = s->txlen[idx];
++    uint32_t pos = 0;
++
++    while (pos + TXDESC_SIZE <= len) {
++        const uint8_t *d = buf + pos;
++        uint32_t dw0 = ldl_le_p(d), dw1 = ldl_le_p(d + 4);
++        uint32_t dw2 = ldl_le_p(d + 8), dw7 = ldl_le_p(d + 28);
++        uint32_t pktlen = dw0 & 0xffff;
++        uint32_t offset = (dw0 >> 16) & 0xff;
++        uint32_t pkt_offset = (dw1 >> 26) & 0x1f;
++        uint32_t qsel = (dw1 >> 8) & 0x1f;
++        uint32_t start = pos + offset + pkt_offset * 8;
++
++        if (!(dw0 & BIT(31)) || pktlen == 0 || offset < TXDESC_SIZE) {
++            /* not a descriptor: drop the stream and resynchronise */
++            RTL_LOG(s, 1, "tx: bad descriptor at %u (dw0=0x%08x), dropping %u bytes\n",
++                    pos, dw0, len);
++            s->txlen[idx] = 0;
++            return;
++        }
++        if (start + pktlen > len) {
++            break;                              /* unit not complete yet */
++        }
++        rtl_handle_tx_frame(s, buf + start, pktlen, qsel);
++        if (dw2 & BIT(19)) {
++            /* driver asked for a TX status report (CCX) */
++            uint16_t sw = (dw7 >> 16) & 0xfff;
++
++            rtl_rx_tx_report(s, dw1 & 0x3f, sw & 0xff, sw >> 8, qsel);
++        }
++        pos = MIN(ROUND_UP(start + pktlen, 8), len);
++    }
++    if (pos) {
++        memmove(buf, buf + pos, len - pos);
++        s->txlen[idx] = len - pos;
++    }
++}
++
++/* ---- netdev side --------------------------------------------------------- */
++static bool rtl_can_receive(NetClientState *nc)
++{
++    /* frames arriving before the link is up are simply dropped */
++    return true;
++}
++
++static ssize_t rtl_receive(NetClientState *nc, const uint8_t *buf, size_t size)
++{
++    RTL8188EUState *s = qemu_get_nic_opaque(nc);
++    uint8_t eth[2048];
++    uint16_t ethertype;
++
++    if (s->state != STA_CONNECTED || size < 14 || size > sizeof(eth)) {
++        return size;
++    }
++    memcpy(eth, buf, size);
++    /* learn the peer and present ourselves as the station */
++    memcpy(s->peer_mac, eth + 6, 6);
++    s->peer_known = true;
++    memcpy(eth + 6, s->sta_mac, 6);
++    ethertype = lduw_be_p(eth + 12);
++    if (ethertype == ETH_P_ARP && size >= 42 &&
++        !memcmp(eth + 22, s->peer_mac, 6)) {
++        memcpy(eth + 22, s->sta_mac, 6);            /* sender hw address */
++    }
++    if (ethertype == 0x0800 && size >= 34 && s->state == STA_CONNECTED) {
++        uint32_t src_ip, dst_ip;
++
++        memcpy(&src_ip, eth + 26, 4);
++        memcpy(&dst_ip, eth + 30, 4);
++        rtl_peer_announce(s, src_ip, dst_ip);
++    }
++    rtl_hexdump(s, 3, "from netdev", eth, size);
++    rtl_sta_send_data(s, eth, ethertype, eth + 14, size - 14);
++    return size;
++}
++
++static NetClientInfo net_rtl8188eu_info = {
++    .type = NET_CLIENT_DRIVER_NIC,
++    .size = sizeof(NICState),
++    .can_receive = rtl_can_receive,
++    .receive = rtl_receive,
++};
++
++/* ---- USB glue ------------------------------------------------------------ */
++enum {
++    STR_MANUFACTURER = 1,
++    STR_PRODUCT,
++    STR_SERIALNUMBER,
++};
++
++static const USBDescStrings desc_strings = {
++    [STR_MANUFACTURER] = "Realtek",
++    [STR_PRODUCT]      = "802.11n NIC",
++    [STR_SERIALNUMBER] = "00e04c000001",
++};
++
++static const USBDescIface desc_iface_high = {
++    .bInterfaceNumber   = 0,
++    .bNumEndpoints      = 4,
++    .bInterfaceClass    = 0xff,
++    .bInterfaceSubClass = 0xff,
++    .bInterfaceProtocol = 0xff,
++    .eps = (USBDescEndpoint[]) {
++        { .bEndpointAddress = USB_DIR_IN | 0x01, .bmAttributes = USB_ENDPOINT_XFER_BULK, .wMaxPacketSize = 512 },
++        { .bEndpointAddress = USB_DIR_OUT | 0x02, .bmAttributes = USB_ENDPOINT_XFER_BULK, .wMaxPacketSize = 512 },
++        { .bEndpointAddress = USB_DIR_OUT | 0x03, .bmAttributes = USB_ENDPOINT_XFER_BULK, .wMaxPacketSize = 512 },
++        { .bEndpointAddress = USB_DIR_IN | 0x04, .bmAttributes = USB_ENDPOINT_XFER_INT, .wMaxPacketSize = 64, .bInterval = 1 },
++    },
++};
++
++static const USBDescIface desc_iface_full = {
++    .bInterfaceNumber   = 0,
++    .bNumEndpoints      = 4,
++    .bInterfaceClass    = 0xff,
++    .bInterfaceSubClass = 0xff,
++    .bInterfaceProtocol = 0xff,
++    .eps = (USBDescEndpoint[]) {
++        { .bEndpointAddress = USB_DIR_IN | 0x01, .bmAttributes = USB_ENDPOINT_XFER_BULK, .wMaxPacketSize = 64 },
++        { .bEndpointAddress = USB_DIR_OUT | 0x02, .bmAttributes = USB_ENDPOINT_XFER_BULK, .wMaxPacketSize = 64 },
++        { .bEndpointAddress = USB_DIR_OUT | 0x03, .bmAttributes = USB_ENDPOINT_XFER_BULK, .wMaxPacketSize = 64 },
++        { .bEndpointAddress = USB_DIR_IN | 0x04, .bmAttributes = USB_ENDPOINT_XFER_INT, .wMaxPacketSize = 64, .bInterval = 1 },
++    },
++};
++
++static const USBDescDevice desc_device_high = {
++    .bcdUSB             = 0x0200,
++    .bMaxPacketSize0    = 64,
++    .bNumConfigurations = 1,
++    .confs = (USBDescConfig[]) {
++        {
++            .bNumInterfaces        = 1,
++            .bConfigurationValue   = 1,
++            .bmAttributes          = USB_CFG_ATT_ONE,
++            .bMaxPower             = 250,
++            .nif = 1,
++            .ifs = &desc_iface_high,
++        },
++    },
++};
++
++static const USBDescDevice desc_device_full = {
++    .bcdUSB             = 0x0200,
++    .bMaxPacketSize0    = 64,
++    .bNumConfigurations = 1,
++    .confs = (USBDescConfig[]) {
++        {
++            .bNumInterfaces        = 1,
++            .bConfigurationValue   = 1,
++            .bmAttributes          = USB_CFG_ATT_ONE,
++            .bMaxPower             = 250,
++            .nif = 1,
++            .ifs = &desc_iface_full,
++        },
++    },
++};
++
++static const USBDesc desc_rtl8188eu = {
++    .id = {
++        .idVendor          = 0x0bda,
++        .idProduct         = 0x8179,
++        .bcdDevice         = 0x0000,
++        .iManufacturer     = STR_MANUFACTURER,
++        .iProduct          = STR_PRODUCT,
++        .iSerialNumber     = STR_SERIALNUMBER,
++    },
++    .full = &desc_device_full,
++    .high = &desc_device_high,
++    .str  = desc_strings,
++};
++
++static void rtl_reset_state(RTL8188EUState *s)
++{
++    RxFrame *f;
++
++    memset(s->regs, 0, sizeof(s->regs));
++    memset(s->rf, 0, sizeof(s->rf));
++    /* SYS_CFG: normal chip, UMC vendor, cut C */
++    rtl_reg_set(s, REG_SYS_CFG, 4, (1u << 19) | (2u << 12));
++    s->txlen[0] = s->txlen[1] = 0;
++    while ((f = QSIMPLEQ_FIRST(&s->rxq))) {
++        QSIMPLEQ_REMOVE_HEAD(&s->rxq, next);
++        g_free(f);
++    }
++    s->rxq_len = 0;
++    g_free(s->rx_cur);
++    s->rx_cur = NULL;
++    s->rx_pending = NULL;
++    s->state = STA_IDLE;
++    s->keyed = false;
++    s->seq = 0;
++    s->retries = 0;
++    if (s->timer) {
++        timer_del(s->timer);
++    }
++}
++
++static void rtl_handle_reset(USBDevice *dev)
++{
++    RTL8188EUState *s = USB_RTL8188EU(dev);
++
++    RTL_LOG(s, 1, "usb reset\n");
++    rtl_reset_state(s);
++}
++
++static void rtl_handle_control(USBDevice *dev, USBPacket *p, int request,
++                               int value, int index, int length, uint8_t *data)
++{
++    RTL8188EUState *s = USB_RTL8188EU(dev);
++    int ret;
++
++    ret = usb_desc_handle_control(dev, p, request, value, index, length, data);
++    if (ret >= 0) {
++        return;
++    }
++
++    switch (request) {
++    case VendorDeviceOutRequest | 0x05:
++        if (length > 254) {
++            goto fail;
++        }
++        rtl_write_reg(s, value & 0xffff, data, length);
++        RTL_LOG(s, 2, "reg write 0x%04x len %d = 0x%08x\n", value, length,
++                length <= 4 ? rtl_reg_get(s, value, length) : 0);
++        p->actual_length = length;
++        return;
++    case VendorDeviceRequest | 0x05:
++        if (length > 254) {
++            goto fail;
++        }
++        rtl_read_reg(s, value & 0xffff, data, length);
++        RTL_LOG(s, 2, "reg read  0x%04x len %d = 0x%08x\n", value, length,
++                length <= 4 ? (uint32_t)(length == 1 ? data[0] :
++                              length == 2 ? lduw_le_p(data) : ldl_le_p(data))
++                            : 0);
++        p->actual_length = length;
++        return;
++    default:
++        break;
++    }
++fail:
++    RTL_LOG(s, 1, "unhandled control request 0x%x value 0x%x index 0x%x len %d\n",
++            request, value, index, length);
++    p->status = USB_RET_STALL;
++}
++
++static void rtl_handle_data(USBDevice *dev, USBPacket *p)
++{
++    RTL8188EUState *s = USB_RTL8188EU(dev);
++    int ep = p->ep->nr;
++
++    if (p->pid == USB_TOKEN_OUT && (ep == 2 || ep == 3)) {
++        int idx = ep - 2;
++        uint32_t room = sizeof(s->txbuf[idx]) - s->txlen[idx];
++        uint32_t n = MIN(p->iov.size, room);
++
++        usb_packet_copy(p, s->txbuf[idx] + s->txlen[idx], n);
++        s->txlen[idx] += n;
++        RTL_LOG(s, 2, "bulk out ep%d packet %zu bytes (buffered %u)\n", ep,
++                p->iov.size, s->txlen[idx]);
++        rtl_tx_drain(s, idx);
++        if (s->txlen[idx] >= sizeof(s->txbuf[idx])) {
++            s->txlen[idx] = 0;                  /* overrun: resynchronise */
++        }
++        return;
++    }
++    if (p->pid == USB_TOKEN_IN && ep == 1) {
++        if (s->rx_pending) {
++            RTL_LOG(s, 1, "second bulk-in while one is pending\n");
++            p->status = USB_RET_NAK;
++            return;
++        }
++        if (rtl_rx_fill(s, p)) {
++            return;                             /* data available now */
++        }
++        s->rx_pending = p;                      /* completes when data arrives */
++        p->status = USB_RET_ASYNC;
++        return;
++    }
++    if (p->pid == USB_TOKEN_IN && ep == 4) {
++        p->status = USB_RET_NAK;
++        return;
++    }
++    p->status = USB_RET_STALL;
++}
++
++static void rtl_cancel_packet(USBDevice *dev, USBPacket *p)
++{
++    RTL8188EUState *s = USB_RTL8188EU(dev);
++
++    if (s->rx_pending == p) {
++        s->rx_pending = NULL;
++    }
++}
++
++static void rtl_realize(USBDevice *dev, Error **errp)
++{
++    RTL8188EUState *s = USB_RTL8188EU(dev);
++    const char *t = getenv("RTL8188EU_TRACE");
++
++    s->trace = t ? atoi(t) : 1;
++    usb_desc_create_serial(dev);
++    usb_desc_init(dev);
++    qemu_macaddr_default_if_unset(&s->conf.macaddr);
++    /* the station (netdev side) uses the NIC MAC; the adapter's own MAC
++     * (Realtek OUI, last two octets from the NIC MAC so the SSID suffix the
++     * firmware derives from it stays recognisable) must differ from it */
++    memcpy(s->sta_mac, s->conf.macaddr.a, 6);
++    memcpy(s->dev_mac, "\x00\xe0\x4c\xa1", 4);
++    s->dev_mac[4] = s->conf.macaddr.a[4];
++    s->dev_mac[5] = s->conf.macaddr.a[5];
++    if (!s->psk) {
++        s->psk = g_strdup("12345678");
++    }
++    QSIMPLEQ_INIT(&s->rxq);
++    rtl_build_efuse(s);
++    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rtl_sta_timer, s);
++    rtl_reset_state(s);
++    s->nic = qemu_new_nic(&net_rtl8188eu_info, &s->conf,
++                          object_get_typename(OBJECT(s)), dev->qdev.id,
++                          &dev->qdev.mem_reentrancy_guard, s);
++    qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
++    RTL_LOG(s, 1, "realized, station mac %02x:%02x:%02x:%02x:%02x:%02x psk '%s'\n",
++            s->sta_mac[0], s->sta_mac[1], s->sta_mac[2], s->sta_mac[3],
++            s->sta_mac[4], s->sta_mac[5], s->psk);
++}
++
++static void rtl_unrealize(USBDevice *dev)
++{
++    RTL8188EUState *s = USB_RTL8188EU(dev);
++
++    timer_free(s->timer);
++    s->timer = NULL;
++    qemu_del_nic(s->nic);
++}
++
++static const Property rtl8188eu_properties[] = {
++    DEFINE_NIC_PROPERTIES(RTL8188EUState, conf),
++    DEFINE_PROP_STRING("psk", RTL8188EUState, psk),
++};
++
++static void rtl8188eu_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
++
++    uc->realize        = rtl_realize;
++    uc->unrealize      = rtl_unrealize;
++    uc->product_desc   = "Realtek RTL8188EU 802.11n USB adapter";
++    uc->usb_desc       = &desc_rtl8188eu;
++    uc->handle_reset   = rtl_handle_reset;
++    uc->handle_control = rtl_handle_control;
++    uc->handle_data    = rtl_handle_data;
++    uc->cancel_packet  = rtl_cancel_packet;
++    set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
++    dc->fw_name = "network";
++    device_class_set_props(dc, rtl8188eu_properties);
++}
++
++static const TypeInfo rtl8188eu_info = {
++    .name          = TYPE_USB_RTL8188EU,
++    .parent        = TYPE_USB_DEVICE,
++    .instance_size = sizeof(RTL8188EUState),
++    .class_init    = rtl8188eu_class_init,
++};
++
++static void rtl8188eu_register_types(void)
++{
++    type_register_static(&rtl8188eu_info);
++}
++
++type_init(rtl8188eu_register_types)
+--- a/hw/usb/Kconfig	2026-09-17 07:51:20.203062029 +0200
++++ b/hw/usb/Kconfig	2026-09-17 07:51:20.203062029 +0200
+@@ -152,6 +152,7 @@
+     bool
+     select USB
+ 
++config USB_RTL8188EU
+     bool
+     default y
+     depends on USB
+--- a/hw/usb/meson.build	2026-09-17 07:51:20.213062027 +0200
++++ b/hw/usb/meson.build	2026-09-17 07:51:20.203062029 +0200
+@@ -14,6 +14,7 @@
+ # usb host adapters
+ system_ss.add(when: 'CONFIG_USB_UHCI', if_true: files('hcd-uhci.c'))
+ system_ss.add(when: 'CONFIG_USB_MUSB', if_true: files('hcd-musb.c'))
++system_ss.add(when: 'CONFIG_USB_RTL8188EU', if_true: files('dev-rtl8188eu.c'))
+ system_ss.add(when: 'CONFIG_USB_OHCI', if_true: files('hcd-ohci.c'))
+ system_ss.add(when: 'CONFIG_USB_OHCI_PCI', if_true: files('hcd-ohci-pci.c'))
+ system_ss.add(when: 'CONFIG_USB_OHCI_SYSBUS', if_true: files('hcd-ohci-sysbus.c'))
