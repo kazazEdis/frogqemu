@@ -19,6 +19,8 @@
 #include "hw/mips/mips.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
+#include "hw/usb.h"
+#include "hw/usb/hcd-musb.h"
 #include "migration/vmstate.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
@@ -27,6 +29,8 @@
 #include "system/block-backend-global-state.h"
 #include "system/blockdev.h"
 #include "system/reset.h"
+#include "system/runstate.h"
+#include "system/system.h"
 #include "system/dma.h"
 #include "exec/tb-flush.h"
 #include "ui/input.h"
@@ -160,6 +164,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SF2000LCDState, SF2000_LCD)
 #define SF2000_IRQ_STATUS1     0x18800030ULL
 #define SF2000_IRQ_STATUS2     0x18800034ULL
 #define SF2000_IRQ_ENABLE1     0x18800038ULL
+#define SF2000_IRQ_ENABLE2     0x1880003cULL
 #define SF2000_TIMER_COUNT     8
 #define SF2000_TIMER_STEP      0x10
 #define SF2000_TIMER_CTRL_EN   BIT(2)
@@ -391,6 +396,67 @@ static uint8_t sf2000_bootrom_bytes[SF2000_BOOT_SIZE];
 static QEMUTimer *sf2000_irq_poll_timer;
 static bool sf2000_bootrom_ram_entry;
 static uint8_t sf2000_sflash_cmd;
+static uint32_t sf2000_irq2_pending;   /* INTC bank 2 (0x18800034) level bits */
+static void sf2000_update_irq(void);
+
+/*
+ * Board profiles. The SoC model is shared; boards differ in the chip-ID word
+ * the firmware dispatches on, the SPI-NOR part (JEDEC ID the bootloader
+ * probes), and the display type advertised in the bootloader handoff.
+ *
+ *   sf2000  Data Frog SF2000 handheld: HC1512 (0x1512), XMC XM25QH40B, RGB LCD.
+ *   hccast  AnyCast HDMI dongle (HiChip HC1512 house-marked DH350C, hcRTOS +
+ *           hccast firmware "hccastsmartdisplay / HiCast v3.6"). Its
+ *           get_cpu_mhz() accepts chip ID 0x1512 only (anything else returns 0
+ *           and the tick converter divides by zero); the ALi-era compare list
+ *           in its reset stub (0x3503/0x3505/...) is dead code. The flash is a
+ *           4 MB part answering JEDEC 5e 40 16 - with the SF2000's 512 KB
+ *           XM25QH40B reply the firmware's chunk scan stops before the OSD
+ *           resource chunk at 0x307870 and halts. Output is HDMI.
+ */
+typedef struct SF2000BoardProfile {
+    const char *name;
+    uint32_t chip_id;      /* 32-bit word read back at 0x18800000 */
+    uint8_t jedec_id[3];   /* reply to SPI-NOR command 0x9f */
+    uint8_t res_id;        /* device ID after 0xab (release power-down / RES):
+                            * the hcRTOS flash driver sizes the part as
+                            * 1 << (res_id + 1) bytes: 0x13 = 1 MB, 0x15 = 4 MB */
+    uint32_t tvsys;        /* bootloader handoff display type */
+    uint32_t disp_w, disp_h; /* GMA output canvas (screen) size; 0 = LCD size */
+    bool has_musb;         /* real MUSB HDRC host model on USB0/USB1 (with a
+                            * USB bus devices can be attached to) instead of
+                            * the register-store shells */
+} SF2000BoardProfile;
+
+static const SF2000BoardProfile sf2000_board_sf2000 = {
+    .name = "sf2000",
+    .chip_id = SF2000_CHIP_ID_VALUE,
+    .jedec_id = { 0x20, 0x40, 0x13 },
+    .res_id = 0x13,
+    .tvsys = SF2000_TVSYS_RGB_LCD,
+};
+
+static const SF2000BoardProfile sf2000_board_hccast = {
+    .name = "hccast",
+    .chip_id = SF2000_CHIP_ID_VALUE,
+    .jedec_id = { 0x5e, 0x40, 0x16 },
+    .res_id = 0x15,
+    .tvsys = 0,
+    .has_musb = true,
+    .disp_w = 1920,
+    .disp_h = 1080,
+};
+
+static const SF2000BoardProfile *sf2000_board = &sf2000_board_sf2000;
+
+typedef struct SF2000MachineClass {
+    MachineClass parent_class;
+    const SF2000BoardProfile *profile;
+} SF2000MachineClass;
+
+#define TYPE_SF2000_BASE_MACHINE MACHINE_TYPE_NAME("sf2000-base")
+DECLARE_CLASS_CHECKERS(SF2000MachineClass, SF2000_MACHINE,
+                       TYPE_SF2000_BASE_MACHINE)
 static uint32_t sf2000_sdio_arg;
 static uint8_t sf2000_sdio_cmd;
 static uint32_t sf2000_sdio_resp[4];
@@ -701,6 +767,39 @@ static void sf2000_patch_stock_security_check(void)
         queue_tb_flush(cs);
         sf2000_stock_security_patched = true;
         warn_report("sf2000: patched stock security_check for diagnostic boot");
+    }
+}
+
+/*
+ * hccast: the dongle application derives nine 16-byte digests from the chip
+ * and compares them with a reference blob before it will start any network
+ * service ("1 cmp i=0" .. "9 cmp i=0" on the console when none matches).
+ * None of the inputs exist in the emulator, so the final "no match" branch
+ * (bnel $s0,$v0 at 0x8045fdc0) is turned into a nop: the function then
+ * records success exactly as on a genuine unit.  SF2000_NO_PATCH_SECURITY=1
+ * keeps the stock behaviour.
+ */
+static bool sf2000_hccast_security_patched;
+
+static void sf2000_patch_hccast_security_check(void)
+{
+    static const uint8_t original[] = { 0x04, 0x00, 0x02, 0x56 }; /* bnel */
+    static const uint8_t patch[] = { 0x00, 0x00, 0x00, 0x00 };    /* nop */
+    const hwaddr paddr = 0x0045fdc0;
+    uint8_t current[sizeof(original)];
+    CPUState *cs = first_cpu;
+
+    if (sf2000_hccast_security_patched || !sf2000_board->has_musb ||
+        g_getenv("SF2000_NO_PATCH_SECURITY") || !cs) {
+        return;
+    }
+    cpu_physical_memory_read(paddr, current, sizeof(current));
+    if (memcmp(current, original, sizeof(original)) == 0) {
+        cpu_physical_memory_write(paddr, patch, sizeof(patch));
+        queue_tb_flush(cs);
+        sf2000_hccast_security_patched = true;
+        info_report("sf2000: hccast security-id check patched (0x%08x)",
+                    (uint32_t)paddr + 0x80000000u);
     }
 }
 
@@ -1222,6 +1321,17 @@ static bool sf2000_sb_timer_pending(void)
     return false;
 }
 
+static bool sf2000_irq2_active(void)
+{
+    uint32_t enable = 0;
+
+    if (!sf2000_irq2_pending) {
+        return false;
+    }
+    sf2000_mmio_get32(SF2000_IRQ_ENABLE2, &enable);
+    return (sf2000_irq2_pending & enable) != 0;
+}
+
 static void sf2000_timer_ack(void)
 {
     sf2000_next_tick_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -1252,7 +1362,8 @@ static void sf2000_update_irq(void)
                   sf2000_irq1_enabled(SF2000_IRC_IRQ)) ||
                  (sf2000_sb_timer_pending() && !sf2000_sb_timer_irq_masked) ||
                  (sf2000_sdio_irq_pending &&
-                  sf2000_irq1_enabled(SF2000_SDIO_IRQ)));
+                  sf2000_irq1_enabled(SF2000_SDIO_IRQ)) ||
+                 sf2000_irq2_active());
 }
 
 static void sf2000_irq_poll_timer_cb(void *opaque)
@@ -1265,6 +1376,7 @@ static void sf2000_irq_poll_timer_cb(void *opaque)
      */
     sf2000_trace_pc_landmark();
     sf2000_patch_stock_security_check();
+    sf2000_patch_hccast_security_check();
     sf2000_patch_stock_archive_path();
     sf2000_patch_stock_archive_access_wait();
     sf2000_update_irq();
@@ -1321,6 +1433,61 @@ static bool sf2000_trace_gma(void)
     return trace != 0;
 }
 
+static uint32_t sf2000_gma_bg_colour(void)
+{
+    static uint32_t colour;
+    static bool init;
+
+    if (!init) {
+        const char *env = g_getenv("SF2000_GMA_BG");
+
+        colour = 0xff000000u;
+        if (env && env[0]) {
+            colour |= (uint32_t)g_ascii_strtoull(env, NULL, 16) & 0xffffffu;
+        }
+        init = true;
+    }
+    return colour;
+}
+
+static bool sf2000_trace_de(void)
+{
+    static int trace = -1;
+
+    if (trace < 0) {
+        /* SF2000_TRACE_DE=1: log every access to the display-engine block */
+        const char *env = g_getenv("SF2000_TRACE_DE");
+
+        trace = env && env[0] && g_strcmp0(env, "0") != 0;
+    }
+    return trace != 0;
+}
+
+static bool sf2000_hdmi_hpd(void)
+{
+    static int hpd = -1;
+
+    if (hpd < 0) {
+        /* SF2000_HDMI_HPD=0 leaves the HDMI sink unplugged (default: plugged) */
+        const char *env = g_getenv("SF2000_HDMI_HPD");
+
+        hpd = !(env && env[0] && g_strcmp0(env, "0") == 0);
+    }
+    return hpd != 0;
+}
+
+static bool sf2000_trace_mmio_pc(void)
+{
+    static int trace = -1;
+
+    if (trace < 0) {
+        const char *env = g_getenv("SF2000_TRACE_MMIO_PC");
+
+        trace = env && env[0] && g_strcmp0(env, "0") != 0;
+    }
+    return trace != 0;
+}
+
 static bool sf2000_trace_sflash(void)
 {
     static int trace = -1;
@@ -1367,7 +1534,7 @@ static void sf2000_log_mmio(const char *kind, hwaddr addr, uint64_t value,
         (addr >= SF2000_AVPHY_BASE &&
          addr < SF2000_AVPHY_BASE + SF2000_AVPHY_SIZE) ||
         (addr >= SF2000_GE_BASE && addr < SF2000_GE_BASE + SF2000_GE_SIZE) ||
-        (addr >= SF2000_GMA_BASE &&
+        (!sf2000_trace_de() && addr >= SF2000_GMA_BASE &&
          addr < SF2000_GMA_BASE + SF2000_GMA_SIZE) ||
         (addr >= SF2000_ADC_BASE && addr < SF2000_ADC_BASE + SF2000_ADC_SIZE) ||
         (addr >= SF2000_WDT_BASE && addr < SF2000_WDT_BASE + SF2000_WDT_SIZE) ||
@@ -1382,7 +1549,7 @@ static void sf2000_log_mmio(const char *kind, hwaddr addr, uint64_t value,
         (addr >= SF2000_AUX_BASE && addr < SF2000_AUX_BASE + SF2000_AUX_SIZE &&
          !sf2000_trace_aux()) ||
         (sf2000_sysio_quiet_addr(addr) && !sf2000_trace_sysio()) ||
-        (addr >= 0x1882e098 && addr < 0x1882e0a4) ||
+        (addr >= 0x1882e098 && addr < 0x1882e0a4 && !sf2000_trace_sflash()) ||
         addr == SF2000_GPIO_L_OUT || addr == 0x18800354 ||
         addr == 0x18800058 || addr == 0x18800358 ||
         addr == 0x1880a038 || addr == 0x1880a03a ||
@@ -1396,6 +1563,22 @@ static void sf2000_log_mmio(const char *kind, hwaddr addr, uint64_t value,
         return;
     }
 
+    if (sf2000_trace_mmio_pc()) {
+        /* SF2000_TRACE_MMIO_PC=1: append the guest PC and $ra of the access */
+        CPUState *cs = current_cpu;
+        uint32_t pc = 0, ra = 0;
+
+        if (cs) {
+            CPUMIPSState *env = &MIPS_CPU(cs)->env;
+
+            pc = env->active_tc.PC;
+            ra = env->active_tc.gpr[31];
+        }
+        qemu_log_mask(LOG_UNIMP, "sf2000: %s addr=0x%08" HWADDR_PRIx
+                      " size=%u value=0x%08" PRIx64 " pc=0x%08x ra=0x%08x\n",
+                      kind, addr, size, value, pc, ra);
+        return;
+    }
     qemu_log_mask(LOG_UNIMP, "sf2000: %s addr=0x%08" HWADDR_PRIx
                   " size=%u value=0x%08" PRIx64 "\n",
                   kind, addr, size, value);
@@ -1529,77 +1712,371 @@ static void sf2000_ge_memcpy(uint32_t dst, uint32_t src, size_t len)
     g_free(buf);
 }
 
+/*
+ * GE command node (31 words, decoded from libge's cmdq_node_context and the
+ * queues the hccast application submits):
+ *   [0]  group mask (0x0201ffff)          [1]  func: 0x..08 blit, 0x..300 fill
+ *   [2]  dst base  [3] dst type            [4]/[5] dst read-back surface
+ *   [6]  src base  [7] src type            [8]/[9] mask surface
+ *   [10] fill colour (raw pixel)           [13] internal format
+ *   [16] dst xy    [17] dst wh             [18] src xy   [20] src wh
+ *   [24] clut ctl  [25] clut pointer       [28] global alpha
+ *   [29]/[30] colour-key min/max sentinels
+ * A "type" word carries the HCFB_FMT_* pixel format in bits 15:12 and the
+ * surface pitch in pixels in bits 11:0.
+ */
+static unsigned sf2000_ge_bpp(uint32_t fmt)
+{
+    switch (fmt) {
+    case 0x0: return 3;
+    case 0x1: return 4;
+    case 0x2: case 0x3: case 0x5: case 0x6: return 2;
+    case 0xc: return 1;
+    default: return 0;
+    }
+}
+
+static uint32_t sf2000_ge_to_argb(uint32_t fmt, const uint8_t *p,
+                                  const uint32_t *clut)
+{
+    uint32_t v, r, g, b, a;
+
+    switch (fmt) {
+    case 0x0:
+        return 0xff000000u | (p[2] << 16) | (p[1] << 8) | p[0];
+    case 0x1:
+        return ldl_le_p(p);
+    case 0x2:
+    case 0x3:
+        v = lduw_le_p(p);
+        a = fmt == 0x3 ? ((v >> 12) & 0xf) * 17 : 0xff;
+        return (a << 24) | ((((v >> 8) & 0xf) * 17) << 16) |
+               ((((v >> 4) & 0xf) * 17) << 8) | ((v & 0xf) * 17);
+    case 0x5:
+        v = lduw_le_p(p);
+        r = (v >> 10) & 0x1f; g = (v >> 5) & 0x1f; b = v & 0x1f;
+        return ((v & 0x8000) ? 0xff000000u : 0) | ((r << 3 | r >> 2) << 16) |
+               ((g << 3 | g >> 2) << 8) | (b << 3 | b >> 2);
+    case 0x6:
+        v = lduw_le_p(p);
+        r = (v >> 11) & 0x1f; g = (v >> 5) & 0x3f; b = v & 0x1f;
+        return 0xff000000u | ((r << 3 | r >> 2) << 16) |
+               ((g << 2 | g >> 4) << 8) | (b << 3 | b >> 2);
+    case 0xc:
+        return clut ? clut[p[0]] : (0xff000000u | (p[0] * 0x010101u));
+    default:
+        return 0;
+    }
+}
+
+static void sf2000_ge_from_argb(uint32_t fmt, uint8_t *p, uint32_t c)
+{
+    uint32_t a = c >> 24, r = (c >> 16) & 0xff, g = (c >> 8) & 0xff, b = c & 0xff;
+
+    switch (fmt) {
+    case 0x0:
+        p[0] = b; p[1] = g; p[2] = r;
+        break;
+    case 0x1:
+        stl_le_p(p, c);
+        break;
+    case 0x2:
+        stw_le_p(p, ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4));
+        break;
+    case 0x3:
+        stw_le_p(p, ((a >> 4) << 12) | ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4));
+        break;
+    case 0x5:
+        stw_le_p(p, ((a >= 0x80) ? 0x8000 : 0) | ((r >> 3) << 10) |
+                    ((g >> 3) << 5) | (b >> 3));
+        break;
+    case 0x6:
+        stw_le_p(p, ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+        break;
+    default:
+        break;
+    }
+}
+
+/*
+ * Node length from the group-mask word. Groups 0..16 (mask 0x1ffff) carry the
+ * 30 words listed above; group 18 appends the 7-word stretch/filter block
+ * (two zero words, mode, 0x100 scale, coefficient table VA, 1, table VA).
+ */
+static uint32_t sf2000_ge_node_words(uint32_t mask_word)
+{
+    uint32_t mask = mask_word & 0x00ffffff;
+    uint32_t n = 1;
+
+    if ((mask_word & 0xff000000) != 0x02000000 || (mask & 0x1ffff) != 0x1ffff) {
+        return 0;
+    }
+    n += 30;
+    mask &= ~0x1ffffu;
+    if (mask & BIT(18)) {
+        n += 7;
+        mask &= ~BIT(18);
+    }
+    return mask ? 0 : n;
+}
+
+static unsigned sf2000_ge_tile_count;
+
+static void sf2000_ge_dump_tile(uint32_t src, uint32_t sfmt, uint32_t spitch,
+                                uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
+                                const uint32_t *clut)
+{
+    const char *dir = g_getenv("SF2000_GE_TILE_DIR");
+    unsigned sbpp = sf2000_ge_bpp(sfmt);
+    g_autofree char *path = NULL;
+    g_autofree uint8_t *row = NULL;
+    g_autofree uint8_t *out = NULL;
+    FILE *f;
+    uint32_t x, y;
+
+    if (!dir || !*dir || !sbpp || sf2000_ge_tile_count >= 200) {
+        return;
+    }
+    path = g_strdup_printf("%s/ge-tile-%03u-%08x-%ux%u-fmt%u.ppm", dir,
+                           sf2000_ge_tile_count++, src, sw, sh, sfmt);
+    f = fopen(path, "wb");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "P6\n%u %u\n255\n", sw, sh);
+    row = g_malloc(sw * sbpp);
+    out = g_malloc(sw * 3);
+    for (y = 0; y < sh; y++) {
+        if (address_space_read(&address_space_memory,
+                               src + ((uint64_t)(sy + y) * spitch + sx) * sbpp,
+                               MEMTXATTRS_UNSPECIFIED, row, sw * sbpp) != MEMTX_OK) {
+            break;
+        }
+        for (x = 0; x < sw; x++) {
+            uint32_t c = sf2000_ge_to_argb(sfmt, row + x * sbpp, clut);
+
+            if (!(c >> 24)) {
+                c = 0xff00ff; /* transparent shown as magenta */
+            }
+            out[x * 3] = c >> 16;
+            out[x * 3 + 1] = c >> 8;
+            out[x * 3 + 2] = c;
+        }
+        fwrite(out, 1, sw * 3, f);
+    }
+    fclose(f);
+}
+
 static void sf2000_ge_execute_node(uint32_t *node, uint32_t words)
 {
-    uint32_t dst;
-    uint32_t src;
-    uint32_t fmt;
-    uint32_t width;
-    uint32_t height;
-    size_t len;
+    uint32_t func, dst, dtype, dfmt, dpitch, dx, dy, dw, dh;
+    uint32_t src, stype, sfmt, spitch, sx, sy, sw, sh;
+    uint32_t bg, btype, bfmt, bpitch, bx, by;
+    uint32_t clut_ptr, galpha, colour;
+    unsigned dbpp, sbpp, bbpp;
+    uint32_t clut[256];
+    bool have_clut = false;
+    bool blit, copy, blend;
+    uint8_t *srow = NULL, *brow = NULL, *drow = NULL;
+    uint32_t y, x;
 
-    if (words < 26 || node[0] != 0x0201ffff) {
+    if (words < 29 || (node[0] & 0xff000000) != 0x02000000) {
+        return;
+    }
+    func = node[1];
+    dst = node[2];
+    dtype = node[3];
+    bg = node[4];
+    btype = node[5];
+    src = node[6];
+    stype = node[7];
+    dx = node[16] & 0xffff;
+    dy = node[16] >> 16;
+    dw = node[17] & 0xffff;
+    dh = node[17] >> 16;
+    bx = node[18] & 0xffff;
+    by = node[18] >> 16;
+    sx = node[19] & 0xffff;
+    sy = node[19] >> 16;
+    sw = node[20] & 0xffff;
+    sh = node[20] >> 16;
+    clut_ptr = node[25];
+    galpha = node[28] & 0xff;
+    dfmt = (dtype >> 12) & 0xf;
+    dpitch = dtype & 0xfff;
+    sfmt = (stype >> 12) & 0xf;
+    spitch = stype & 0xfff;
+    bfmt = (btype >> 12) & 0xf;
+    bpitch = btype & 0xfff;
+    dbpp = sf2000_ge_bpp(dfmt);
+    sbpp = sf2000_ge_bpp(sfmt);
+    bbpp = sf2000_ge_bpp(bfmt);
+    blit = (func & 0x8) && src;
+    copy = !(func & 0x8) && (func & 0x1) && bg;
+    /*
+     * The plain 0x00200008 blit hccast issues is a straight copy (transparent
+     * pixels overwrite the OSD, the GMA composes the layer over the video).
+     * hcge_blit ORs 0x4000 into the func word for the DFB alpha-blend flags;
+     * bits 18/19 (0x002c0008, the CLUT8 -> ARGB8888 palette conversion) are
+     * not a blend: that node must reproduce the CLUT verbatim.
+     */
+    blend = (func & BIT(14)) != 0;
+
+    if (!dst || !dbpp || !dw || !dh || dw > 4096 || dh > 4096) {
+        if (sf2000_trace_ge()) {
+            qemu_log_mask(LOG_UNIMP, "sf2000: ge-skip func=0x%08x dst=0x%08x dtype=0x%08x wh=%ux%u\n",
+                          func, dst, dtype, dw, dh);
+        }
+        return;
+    }
+    if (!dpitch) {
+        dpitch = dw;
+    }
+
+    if (!blit && !copy) {
+        /*
+         * Solid fill: func bits 9:8 fill with the colour in word 10, bit 10
+         * clears with the colour in word 12. Both are raw destination pixels.
+         */
+        uint8_t px[4];
+
+        if (func & 0x400) {
+            colour = node[12];
+        } else if (func & 0x300) {
+            colour = node[10];
+        } else {
+            if (sf2000_trace_ge()) {
+                qemu_log_mask(LOG_UNIMP, "sf2000: ge-skip-func func=0x%08x dst=0x%08x src=0x%08x bg=0x%08x\n",
+                              func, dst, src, bg);
+            }
+            return;
+        }
+        drow = g_malloc(dw * dbpp);
+        stl_le_p(px, colour);
+        for (x = 0; x < dw; x++) {
+            memcpy(drow + x * dbpp, px, dbpp);
+        }
+        for (y = 0; y < dh; y++) {
+            address_space_write(&address_space_memory,
+                                dst + ((uint64_t)(dy + y) * dpitch + dx) * dbpp,
+                                MEMTXATTRS_UNSPECIFIED, drow, dw * dbpp);
+        }
+        g_free(drow);
+        if (sf2000_trace_ge()) {
+            qemu_log_mask(LOG_UNIMP, "sf2000: ge-fill dst=0x%08x fmt=%u rect=%u,%u %ux%u colour=0x%08x func=0x%08x\n",
+                          dst, dfmt, dx, dy, dw, dh, colour, func);
+        }
         return;
     }
 
-    dst = node[2];
-    src = node[6];
-    fmt = node[13] & 0xff;
-    width = node[17] >> 16;
-    height = node[17] & 0xffff;
-
-    /*
-     * This command subset is intentionally small and trace-derived:
-     *
-     * - 16x16 source nodes copy 256 ARGB8888 palette entries into the GMA
-     *   palette buffers referenced by the display descriptor.
-     * - Full-screen zero-source nodes clear the eventual GMA bitmap. The stock
-     *   firmware emits these while switching between CLUT8 and RGB565 boot
-     *   surfaces before the menu assets are drawn.
-     *
-     * Unknown nodes are still logged, then treated as completed. That keeps the
-     * boot trace moving while preserving enough evidence for the next hardware
-     * primitive.
-     */
-    if (src && width == 16 && height == 16) {
-        sf2000_ge_memcpy(dst, src, 16 * 16 * 4);
+    if (copy) {
+        /* func 0x1: copy the read-back surface (words 4/5 @ word 18) to dst */
+        src = bg;
+        sfmt = bfmt;
+        spitch = bpitch;
+        sbpp = bbpp;
+        sx = bx;
+        sy = by;
+        sw = dw;
+        sh = dh;
+        bg = 0;
+        galpha = 255;
+    }
+    if (!sw || !sh || sw > 4096 || sh > 4096) {
+        sw = dw;
+        sh = dh;
+    }
+    if (!sbpp) {
         if (sf2000_trace_ge()) {
-            qemu_log_mask(LOG_UNIMP,
-                          "sf2000: ge-copy-palette dst=0x%08x src=0x%08x\n",
-                          dst, src);
+            qemu_log_mask(LOG_UNIMP, "sf2000: ge-skip-src func=0x%08x src=0x%08x stype=0x%08x\n",
+                          func, src, stype);
         }
-    } else if (src && dst && width && height) {
-        if (fmt == 0x0c) {
-            len = (size_t)width * height;
-        } else if (fmt == 0x01 || fmt == 0x06) {
-            len = (size_t)width * height * 2;
-        } else {
-            len = 0;
+        return;
+    }
+    if (!spitch) {
+        spitch = dw;
+    }
+    if (bg && bbpp && !bpitch) {
+        bpitch = dw;
+    }
+    if (sfmt == 0xc && clut_ptr &&
+        address_space_read(&address_space_memory, clut_ptr, MEMTXATTRS_UNSPECIFIED,
+                           clut, sizeof(clut)) == MEMTX_OK) {
+        for (x = 0; x < 256; x++) {
+            clut[x] = le32_to_cpu(clut[x]);
         }
-        if (len) {
-            sf2000_ge_memcpy(dst, src, len);
-            if (sf2000_trace_ge()) {
-                qemu_log_mask(LOG_UNIMP,
-                              "sf2000: ge-copy dst=0x%08x src=0x%08x fmt=0x%x %ux%u len=%zu\n",
-                              dst, src, fmt, width, height, len);
+        have_clut = true;
+    }
+
+    if (!copy) {
+        sf2000_ge_dump_tile(src, sfmt, spitch, sx, sy, sw, sh,
+                            have_clut ? clut : NULL);
+    }
+
+    srow = g_malloc(sw * sbpp);
+    drow = g_malloc(dw * dbpp);
+    if (bg && bbpp) {
+        brow = g_malloc(dw * bbpp);
+    }
+    for (y = 0; y < dh; y++) {
+        uint64_t doff = dst + ((uint64_t)(dy + y) * dpitch + dx) * dbpp;
+        uint32_t src_y = sy + (uint32_t)(((uint64_t)y * sh) / dh);
+
+        if (address_space_read(&address_space_memory,
+                               src + ((uint64_t)src_y * spitch + sx) * sbpp,
+                               MEMTXATTRS_UNSPECIFIED, srow, sw * sbpp) != MEMTX_OK) {
+            break;
+        }
+        if (brow) {
+            if (address_space_read(&address_space_memory,
+                                   bg + ((uint64_t)(by + y) * bpitch + bx) * bbpp,
+                                   MEMTXATTRS_UNSPECIFIED, brow, dw * bbpp) != MEMTX_OK) {
+                break;
             }
+        } else if (address_space_read(&address_space_memory, doff, MEMTXATTRS_UNSPECIFIED,
+                                      drow, dw * dbpp) != MEMTX_OK) {
+            break;
         }
-    } else if (!src && dst && width && height) {
-        if (fmt == 0x0c) {
-            len = (size_t)width * height;
-        } else if (fmt == 0x01 || fmt == 0x06) {
-            len = (size_t)width * height * 2;
-        } else {
-            len = 0;
-        }
-        if (len) {
-            sf2000_ge_memset(dst, 0, len);
-            if (sf2000_trace_ge()) {
-                qemu_log_mask(LOG_UNIMP,
-                              "sf2000: ge-clear dst=0x%08x fmt=0x%x %ux%u len=%zu\n",
-                              dst, fmt, width, height, len);
+        for (x = 0; x < dw; x++) {
+            uint32_t src_x = (sw == dw) ? x : (uint32_t)(((uint64_t)x * sw) / dw);
+            uint32_t s = sf2000_ge_to_argb(sfmt, srow + src_x * sbpp,
+                                           have_clut ? clut : NULL);
+            uint32_t a = ((s >> 24) * galpha) / 255;
+            uint32_t d;
+
+            if (!blend) {
+                /* straight copy / format conversion (global alpha ignored) */
+                sf2000_ge_from_argb(dfmt, drow + x * dbpp, s);
+                continue;
             }
+            if (brow) {
+                d = sf2000_ge_to_argb(bfmt, brow + x * bbpp, NULL);
+            } else {
+                d = sf2000_ge_to_argb(dfmt, drow + x * dbpp, NULL);
+            }
+            if (a == 0) {
+                s = d;
+            } else if (a < 255) {
+                uint32_t r = (((s >> 16) & 0xff) * a + ((d >> 16) & 0xff) * (255 - a)) / 255;
+                uint32_t g = (((s >> 8) & 0xff) * a + ((d >> 8) & 0xff) * (255 - a)) / 255;
+                uint32_t b = ((s & 0xff) * a + (d & 0xff) * (255 - a)) / 255;
+                uint32_t da = MAX(a, d >> 24);
+
+                s = (da << 24) | (r << 16) | (g << 8) | b;
+            }
+            sf2000_ge_from_argb(dfmt, drow + x * dbpp, s);
         }
+        address_space_write(&address_space_memory, doff, MEMTXATTRS_UNSPECIFIED,
+                            drow, dw * dbpp);
+    }
+    g_free(srow);
+    g_free(brow);
+    g_free(drow);
+    if (sf2000_trace_ge()) {
+        qemu_log_mask(LOG_UNIMP, "sf2000: ge-%s dst=0x%08x fmt=%u rect=%u,%u %ux%u <- src=0x%08x fmt=%u pitch=%u rect=%u,%u %ux%u bg=0x%08x xy=%u,%u alpha=%u func=0x%08x%s\n",
+                      copy ? "copy" : (sw != dw || sh != dh) ? "stretch" : "blit",
+                      dst, dfmt, dx, dy, dw, dh, src, sfmt, spitch, sx, sy, sw, sh,
+                      bg, bx, by, galpha, func, blend ? " blend" : "");
     }
 }
 
@@ -1631,9 +2108,44 @@ static void sf2000_ge_complete_queue(void)
     }
 
     words = MIN((last - first) / 4u + 1u, (uint32_t)SF2000_GE_QUEUE_DUMP_WORDS);
-    if (sf2000_ge_read_node(first, node, words)) {
-        sf2000_ge_execute_node(node, words);
+
+    /*
+     * Walk every node between first and last (last points at the final word).
+     * libge prefixes optional 2-word group headers (0x81000001 | id) and then
+     * emits a group-mask word (0x02xxxxxx) followed by the fields of each
+     * selected group; the full-mask node hccast uses is 31 words.
+     */
+    {
+        uint32_t p = first;
+        unsigned guard = 0;
+        uint32_t nwords;
+
+        while (p <= last && guard++ < 4096) {
+            uint32_t w;
+
+            if (address_space_read(&address_space_memory, p, MEMTXATTRS_UNSPECIFIED,
+                                   &w, 4) != MEMTX_OK) {
+                break;
+            }
+            w = le32_to_cpu(w);
+            if ((w & 0x81000001) == 0x81000001) {
+                p += 8;
+                continue;
+            }
+            nwords = sf2000_ge_node_words(w);
+            if (!nwords) {
+                if (sf2000_trace_ge()) {
+                    qemu_log_mask(LOG_UNIMP, "sf2000: ge-unknown-word 0x%08x @0x%08x (stop)\n", w, p);
+                }
+                break;
+            }
+            if (sf2000_ge_read_node(p, node, nwords)) {
+                sf2000_ge_execute_node(node, nwords);
+            }
+            p += nwords * 4;
+        }
     }
+    sf2000_ge_read_node(first, node, words);
 
     dump_limit = sf2000_ge_dump_limit();
     node_dump_limit = sf2000_ge_node_dump_limit();
@@ -2367,6 +2879,9 @@ static void sf2000_panel_update_rect(SF2000LCDState *s, uint16_t x, uint16_t y)
     if (!s || x >= SF2000_LCD_WIDTH || y >= SF2000_LCD_HEIGHT) {
         return;
     }
+    if (sf2000_board->disp_w) {
+        return;                 /* no SPI panel on this board; GMA owns the console */
+    }
 
     surface = qemu_console_surface(s->con);
     if (surface_bits_per_pixel(surface) != 32 ||
@@ -2515,13 +3030,18 @@ static void sf2000_write_ppm_from_surface(SF2000LCDState *s, const char *path)
     }
 
     surface = qemu_console_surface(s->con);
-    fprintf(f, "P6\n%d %d\n255\n", SF2000_LCD_WIDTH, SF2000_LCD_HEIGHT);
-    for (y = 0; y < SF2000_LCD_HEIGHT; y++) {
+    if (surface_bits_per_pixel(surface) != 32) {
+        fclose(f);
+        return;
+    }
+    fprintf(f, "P6\n%d %d\n255\n", surface_width(surface),
+            surface_height(surface));
+    for (y = 0; y < surface_height(surface); y++) {
         const uint32_t *src = (const uint32_t *)(surface_data(surface) +
                               y * surface_stride(surface));
         int x;
 
-        for (x = 0; x < SF2000_LCD_WIDTH; x++) {
+        for (x = 0; x < surface_width(surface); x++) {
             uint8_t rgb[3] = {
                 (uint8_t)(src[x] >> 16),
                 (uint8_t)(src[x] >> 8),
@@ -2637,7 +3157,7 @@ static uint64_t sf2000_unimp_read(void *opaque, hwaddr addr, unsigned size)
             sf2000_mmio_set32(SF2000_GPIO_L_ISR, 0);
         }
     } else if (full_addr == SF2000_IRQ_STATUS2) {
-        value = 0;
+        value = sf2000_irq2_pending;
     } else if ((full_addr & ~3u) == SF2000_GPIO_L_IN) {
         value = 0x07800102;
         for (i = 0; i < ARRAY_SIZE(sf2000_regs); i++) {
@@ -2723,6 +3243,12 @@ static uint64_t sf2000_unimp_read(void *opaque, hwaddr addr, unsigned size)
         value = sf2000_timer_ctrl[1] | SF2000_TIMER_CTRL_INT;
     } else if (full_addr == 0x1880f04b) {
         value = 0; /* AUX command complete / idle. */
+    } else if (full_addr == 0x1882c008 && sf2000_hdmi_hpd()) {
+        /*
+         * HDMI TX status: the hccast HDMI control task polls bit 0 (hot-plug
+         * detect) here; a connected sink lets it run the plug-in path.
+         */
+        value = 1;
     } else if (full_addr == 0x1882e09a) {
         value = 0x40; /* SFLASH RX ready. */
     } else if (full_addr == 0x1882e0a0) {
@@ -2881,6 +3407,9 @@ static void sf2000_unimp_write(void *opaque, hwaddr addr, uint64_t value,
         if ((full_addr & 0xff) == 0x04 && value == 0) {
             qemu_log_mask(LOG_UNIMP, "sf2000: watchdog disabled\n");
         }
+    } else if (full_addr == SF2000_IRQ_STATUS2) {
+        /* Write-one-to-clear acknowledge; level sources re-assert on their own. */
+        sf2000_irq2_pending &= ~(uint32_t)value;
     } else if (full_addr == SF2000_IRQ_STATUS1 && (value & SF2000_SDIO_IRQ)) {
         sf2000_sdio_irq_pending = false;
     } else if (sf2000_uart_decode(full_addr, &uart_index, &uart_offset) &&
@@ -3068,7 +3597,7 @@ static bool sf2000_sflash_security_byte(hwaddr addr, uint8_t *byte)
 static uint64_t sf2000_sflash_direct_read(void *opaque, hwaddr addr,
                                           unsigned size)
 {
-    static const uint8_t jedec_id[] = { 0x20, 0x40, 0x13 };
+    const uint8_t *jedec_id = sf2000_board->jedec_id;
     uint64_t value = 0;
     unsigned i;
     CPUState *cs = first_cpu;
@@ -3081,7 +3610,7 @@ static uint64_t sf2000_sflash_direct_read(void *opaque, hwaddr addr,
             byte = 0;
             break;
         case 0x9f: /* Read JEDEC ID. */
-            byte = jedec_id[(addr + i) % ARRAY_SIZE(jedec_id)];
+            byte = jedec_id[(addr + i) % 3];
             break;
         case 0xab:
             /*
@@ -3089,7 +3618,7 @@ static uint64_t sf2000_sflash_direct_read(void *opaque, hwaddr addr,
              * NOR parts return the device ID after three dummy bytes; the
              * stock bootloader reads a 32-bit little-endian word from offset 0.
              */
-            byte = ((addr + i) & 3u) == 3u ? 0x13 : 0x00;
+            byte = ((addr + i) & 3u) == 3u ? sf2000_board->res_id : 0x00;
             break;
         default:
             if (!sf2000_sflash_security_byte(addr + i, &byte)) {
@@ -3114,7 +3643,7 @@ static uint64_t sf2000_sflash_direct_read(void *opaque, hwaddr addr,
         }
     }
 
-    if (sf2000_trace_sflash()) {
+    if (sf2000_trace_sflash() && !g_getenv("SF2000_TRACE_SFLASH_NOREAD")) {
         qemu_log_mask(LOG_UNIMP,
                       "sf2000: sflash-read cmd=0x%02x off=0x%08" HWADDR_PRIx
                       " size=%u value=0x%08" PRIx64 "\n",
@@ -3123,15 +3652,78 @@ static uint64_t sf2000_sflash_direct_read(void *opaque, hwaddr addr,
     return value;
 }
 
+/*
+ * SPI-NOR write path. The SFSPI controller (0x1882e098 command byte, 0x099
+ * mode, 0x09a status) uses the memory-mapped flash window as its address and
+ * data port: after WREN (0x06) a write into the window at offset A with the
+ * erase command latched erases the sector containing A; with page program
+ * (0x02) latched, the bytes written into the window are programmed at that
+ * offset. Programming only clears bits, erasing sets them, like real NOR.
+ * SF2000_FLASH_SAVE=<path> writes the updated 4 MB image back to that file
+ * (after each erase and at exit) so config changes and upgrades persist.
+ */
+static bool sf2000_flash_dirty;
+static Notifier sf2000_flash_exit_notifier;
+
+static void sf2000_flash_save(void)
+{
+    const char *path = g_getenv("SF2000_FLASH_SAVE");
+    g_autoptr(GError) err = NULL;
+
+    if (!path || !*path || !sf2000_flash_dirty) {
+        return;
+    }
+    if (!g_file_set_contents(path, (const char *)sf2000_bootrom_bytes,
+                             SF2000_BOOT_SIZE, &err)) {
+        warn_report("sf2000: flash save to '%s' failed: %s", path,
+                    err ? err->message : "?");
+        return;
+    }
+    sf2000_flash_dirty = false;
+}
+
+static void sf2000_flash_exit(Notifier *n, void *data)
+{
+    sf2000_flash_save();
+}
+
 static void sf2000_sflash_direct_write(void *opaque, hwaddr addr,
                                        uint64_t value, unsigned size)
 {
+    uint32_t off = addr % SF2000_BOOT_SIZE;
+    uint32_t len = 0;
+    unsigned i;
+
     if (sf2000_trace_sflash()) {
         qemu_log_mask(LOG_UNIMP,
-                      "sf2000: sflash-write off=0x%08" HWADDR_PRIx
+                      "sf2000: sflash-write cmd=0x%02x off=0x%08" HWADDR_PRIx
                       " size=%u value=0x%08" PRIx64 "\n",
-                      addr, size, value);
+                      sf2000_sflash_cmd, addr, size, value);
     }
+    switch (sf2000_sflash_cmd) {
+    case 0x02: /* page program */
+        for (i = 0; i < size; i++) {
+            sf2000_bootrom_bytes[(off + i) % SF2000_BOOT_SIZE] &=
+                (uint8_t)(value >> (i * 8));
+        }
+        sf2000_flash_dirty = true;
+        return;
+    case 0x20: len = 0x1000; break;   /* sector erase 4 KB */
+    case 0x52: len = 0x8000; break;   /* block erase 32 KB */
+    case 0xd8: len = 0x10000; break;  /* block erase 64 KB */
+    case 0x60:
+    case 0xc7: len = SF2000_BOOT_SIZE; off = 0; break; /* chip erase */
+    default:
+        return;
+    }
+    off &= ~(len - 1);
+    memset(sf2000_bootrom_bytes + off, 0xff, len);
+    sf2000_flash_dirty = true;
+    if (sf2000_trace_sflash()) {
+        qemu_log_mask(LOG_UNIMP, "sf2000: sflash-erase off=0x%08x len=0x%x\n",
+                      off, len);
+    }
+    sf2000_flash_save();
 }
 
 static const MemoryRegionOps sf2000_sflash_direct_ops = {
@@ -3183,6 +3775,7 @@ static uint32_t sf2000_gma_present_block(SF2000LCDState *s, uint32_t dmba_addr,
     uint32_t mode, clut_update, sx, ex, sy, ey, src_w, src_h, pitch;
     uint32_t sample_w, sample_h;
     uint32_t width, height, bpp;
+    uint32_t canvas_w, canvas_h;
     int y;
 
     if (!s || !dmba_addr) {
@@ -3225,24 +3818,38 @@ static uint32_t sf2000_gma_present_block(SF2000LCDState *s, uint32_t dmba_addr,
     src_h = (d4 >> 16) & 0xfff;
     pitch = (d5 >> 16) & 0x3fff;
 
-    if (ex < sx || ey < sy || sx >= SF2000_LCD_WIDTH ||
-        sy >= SF2000_LCD_HEIGHT || !d7) {
+    /* Output canvas: the board's screen (LCD panel or HDMI frame). */
+    canvas_w = sf2000_board->disp_w ? sf2000_board->disp_w : SF2000_LCD_WIDTH;
+    canvas_h = sf2000_board->disp_h ? sf2000_board->disp_h : SF2000_LCD_HEIGHT;
+
+    if (ex < sx || ey < sy || sx >= canvas_w || sy >= canvas_h || !d7) {
         return d6;
     }
 
-    width = MIN(ex - sx + 1, (uint32_t)SF2000_LCD_WIDTH - sx);
-    height = MIN(ey - sy + 1, (uint32_t)SF2000_LCD_HEIGHT - sy);
-    if (src_w && width > src_w) {
-        width = src_w;
-    }
-    if (src_h && height > src_h) {
-        height = src_h;
+    width = MIN(ex - sx + 1, canvas_w - sx);
+    height = MIN(ey - sy + 1, canvas_h - sy);
+    /* Without the scaler enabled (d0 bit 2) the block is drawn 1:1. */
+    if (!(d0 & BIT(2))) {
+        if (src_w && width > src_w) {
+            width = src_w;
+        }
+        if (src_h && height > src_h) {
+            height = src_h;
+        }
     }
 
+    /* gma_mode = HCFB_FMT_* (hcuapi/fb.h): 0 RGB888, 1 ARGB8888, 2 RGB444,
+     * 3 ARGB4444, 5 ARGB1555, 6 RGB565, 8 CLUT2, ... 0xc CLUT8 */
     switch (mode) {
+    case 0x00: /* RGB888 */
+        bpp = 3;
+        break;
     case 0x01: /* ARGB8888 */
         bpp = 4;
         break;
+    case 0x02: /* RGB444 */
+    case 0x03: /* ARGB4444 */
+    case 0x05: /* ARGB1555 */
     case 0x06: /* RGB565 */
         bpp = 2;
         break;
@@ -3261,8 +3868,9 @@ static uint32_t sf2000_gma_present_block(SF2000LCDState *s, uint32_t dmba_addr,
         break;
     default:
         qemu_log_mask(LOG_UNIMP,
-                      "sf2000: gma-present unsupported mode=%u dmba=0x%08x bitmap=0x%08x\n",
-                      mode, dmba_addr, d7);
+                      "sf2000: gma-present unsupported mode=%u dmba=0x%08x bitmap=0x%08x"
+                      " d0=%08x d1=%08x d2=%08x d3=%08x d4=%08x d5=%08x d6=%08x d8=%08x d9=%08x\n",
+                      mode, dmba_addr, d7, d0, d1, d2, d3, d4, d5, d6, d8, d9);
         return d6;
     }
 
@@ -3281,9 +3889,9 @@ static uint32_t sf2000_gma_present_block(SF2000LCDState *s, uint32_t dmba_addr,
 
     surface = qemu_console_surface(s->con);
     if (surface_bits_per_pixel(surface) != 32 ||
-        surface_width(surface) != SF2000_LCD_WIDTH ||
-        surface_height(surface) != SF2000_LCD_HEIGHT) {
-        qemu_console_resize(s->con, SF2000_LCD_WIDTH, SF2000_LCD_HEIGHT);
+        surface_width(surface) != canvas_w ||
+        surface_height(surface) != canvas_h) {
+        qemu_console_resize(s->con, canvas_w, canvas_h);
         surface = qemu_console_surface(s->con);
     }
     if (surface_bits_per_pixel(surface) != 32) {
@@ -3314,6 +3922,31 @@ static uint32_t sf2000_gma_present_block(SF2000LCDState *s, uint32_t dmba_addr,
             if (mode == 0x06) {
                 dst[x] = sf2000_rgb565_to_surface(
                     lduw_le_p(linebuf + src_x * 2));
+            } else if (mode == 0x05) {
+                uint16_t p = lduw_le_p(linebuf + src_x * 2);
+                uint32_t r = (p >> 10) & 0x1f, g = (p >> 5) & 0x1f, b = p & 0x1f;
+
+                if (!(p & 0x8000)) {
+                    /*
+                     * transparent: the video plane below is not modelled; it
+                     * is blank (black) on the stock home screen. SF2000_GMA_BG
+                     * overrides the stand-in colour (RRGGBB hex).
+                     */
+                    dst[x] = sf2000_gma_bg_colour();
+                } else {
+                    dst[x] = 0xff000000u | ((r << 3 | r >> 2) << 16) |
+                             ((g << 3 | g >> 2) << 8) | (b << 3 | b >> 2);
+                }
+            } else if (mode == 0x03 || mode == 0x02) {
+                uint16_t p = lduw_le_p(linebuf + src_x * 2);
+                uint32_t r = (p >> 8) & 0xf, g = (p >> 4) & 0xf, b = p & 0xf;
+
+                dst[x] = 0xff000000u | ((r * 17) << 16) | ((g * 17) << 8) |
+                         (b * 17);
+            } else if (mode == 0x00) {
+                const uint8_t *p = linebuf + src_x * 3;
+
+                dst[x] = 0xff000000u | (p[2] << 16) | (p[1] << 8) | p[0];
             } else if (mode == 0x01) {
                 dst[x] = sf2000_argb8888_to_surface(
                     ldl_le_p(linebuf + src_x * 4));
@@ -3569,6 +4202,389 @@ static const TypeInfo sf2000_lcd_info = {
     .class_init = sf2000_lcd_class_init,
 };
 
+/*
+ * USB0/USB1: Mentor MUSB HDRC OTG cores (register map identical to the one
+ * hcd-musb.c models: common regs, indexed EP regs, FIFOs at 0x20, bus-control
+ * at 0x80, flat EP regs at 0x100). Offsets >= 0x200 are HC15xx vendor/PHY
+ * registers (the firmware pokes 0x380 during reset); they are kept in a plain
+ * store. The core's per-source interrupt lines are OR-ed into one "MC"
+ * interrupt that lands in INTC bank 2.
+ */
+#define TYPE_SF2000_MUSB "sf2000-musb"
+OBJECT_DECLARE_SIMPLE_TYPE(SF2000MusbState, SF2000_MUSB)
+
+/* Mentor DMA controller: 8 channels at 0x200 (INTR) / 0x204+0x10*n (CNTL,
+ * ADDR, COUNT); RqPktCount for RX AutoReq at 0x300 + 4*ep. */
+#define MUSB_DMA_CHANNELS       8
+#define MUSB_DMA_INTR           0x200
+#define MUSB_DMA_CNTL(n)        (0x204 + 0x10 * (n))
+#define MUSB_DMA_ADDR(n)        (0x208 + 0x10 * (n))
+#define MUSB_DMA_COUNT(n)       (0x20c + 0x10 * (n))
+#define MUSB_RQPKTCOUNT(ep)     (0x300 + 4 * (ep))
+#define MUSB_DMA_ENABLE         BIT(0)
+#define MUSB_DMA_DIR_TX         BIT(1)
+#define MUSB_DMA_MODE1          BIT(2)
+#define MUSB_DMA_IRQ_ENABLE     BIT(3)
+#define MUSB_DMA_EP(cntl)       (((cntl) >> 4) & 0xf)
+
+typedef struct SF2000MusbDma {
+    uint16_t cntl;
+    uint32_t addr;
+    uint32_t count;
+    uint32_t rqpkt;              /* remaining AutoReq packets (RX mode 1) */
+    bool running;                /* inside the TX push loop (re-entrancy guard) */
+} SF2000MusbDma;
+
+struct SF2000MusbState {
+    SysBusDevice parent_obj;
+    MemoryRegion iomem;
+    MUSBState *musb;
+    qemu_irq mc_irq;
+    qemu_irq dma_irq;
+    uint8_t id;                  /* 0 = USB0, 1 = USB1 (log tag only) */
+    uint8_t src_level[musb_irq_max];
+    SF2000MusbDma dma[MUSB_DMA_CHANNELS];
+    uint8_t dma_intr;
+    /* 0x200 .. SF2000_USB_SIZE-1, 32-bit granules */
+    uint32_t vendor[(SF2000_USB_SIZE - 0x200) / 4];
+};
+
+static void sf2000_musb_dma_done(SF2000MusbState *s, int ch)
+{
+    SF2000MusbDma *d = &s->dma[ch];
+
+    d->cntl &= ~MUSB_DMA_ENABLE;
+    if (d->cntl & MUSB_DMA_IRQ_ENABLE) {
+        s->dma_intr |= BIT(ch);
+        qemu_set_irq(s->dma_irq, 1);
+    }
+    if (sf2000_trace_aux()) {
+        qemu_log_mask(LOG_UNIMP, "sf2000: musb%u-dma ch%d done addr=0x%08x"
+                      " remaining=%u intr=0x%02x\n", s->id, ch, d->addr,
+                      d->count, s->dma_intr);
+    }
+}
+
+/* Push as much of a TX channel as the FIFO/endpoint takes right now. */
+static void sf2000_musb_dma_tx_run(SF2000MusbState *s, int ch)
+{
+    SF2000MusbDma *d = &s->dma[ch];
+    int ep = MUSB_DMA_EP(d->cntl);
+    int maxp = musb_ep_maxp(s->musb, ep, 0);
+    uint8_t buf[1024];
+
+    if (maxp <= 0 || maxp > sizeof(buf)) {
+        maxp = MIN(64, (int)sizeof(buf));
+    }
+    if (d->running) {
+        return;                             /* the loop below continues */
+    }
+    d->running = true;
+    while ((d->cntl & MUSB_DMA_ENABLE) && d->count > 0) {
+        uint32_t chunk = MIN(d->count, (uint32_t)maxp);
+        bool full = chunk == (uint32_t)maxp;
+        bool trigger = full && (d->cntl & MUSB_DMA_MODE1);
+
+        if (musb_ep_busy(s->musb, ep, 0)) {
+            d->running = false;
+            return;                         /* continue from the notify */
+        }
+        cpu_physical_memory_read(d->addr, buf, chunk);
+        /* account before launching: the completion may re-enter us */
+        d->addr += chunk;
+        d->count -= chunk;
+        musb_dma_tx(s->musb, ep, buf, chunk, trigger);
+        if (!trigger) {
+            /* mode 0, or the residual short packet of a mode-1 transfer:
+             * the driver sets TXPKTRDY itself */
+            break;
+        }
+        if (musb_ep_busy(s->musb, ep, 0)) {
+            d->running = false;
+            return;                         /* async device: wait */
+        }
+    }
+    d->running = false;
+    if (d->cntl & MUSB_DMA_ENABLE) {
+        sf2000_musb_dma_done(s, ch);
+    }
+}
+
+/* Move a landed RX packet into memory; re-arm the request in mode 1. */
+static bool sf2000_musb_dma_rx_run(SF2000MusbState *s, int ch)
+{
+    SF2000MusbDma *d = &s->dma[ch];
+    int ep = MUSB_DMA_EP(d->cntl);
+    int maxp = musb_ep_maxp(s->musb, ep, 1);
+    uint8_t buf[1024];
+    int len;
+
+    len = musb_dma_rx_take(s->musb, ep, buf, MIN(d->count, sizeof(buf)));
+    if (len < 0) {
+        return false;
+    }
+    cpu_physical_memory_write(d->addr, buf, len);
+    d->addr += len;
+    d->count -= len;
+    if (sf2000_trace_aux()) {
+        qemu_log_mask(LOG_UNIMP, "sf2000: musb%u-dma ch%d rx %d bytes"
+                      " (remaining %u)\n", s->id, ch, len, d->count);
+    }
+    if ((d->cntl & MUSB_DMA_MODE1) && len == maxp && d->count > 0 &&
+        d->rqpkt > 0) {
+        d->rqpkt--;
+        musb_dma_rx_req(s->musb, ep);       /* AutoReq */
+        return true;
+    }
+    sf2000_musb_dma_done(s, ch);
+    return true;
+}
+
+static bool sf2000_musb_dma_notify(void *opaque, int epnum, int dir)
+{
+    SF2000MusbState *s = opaque;
+    int ch;
+
+    for (ch = 0; ch < MUSB_DMA_CHANNELS; ch++) {
+        SF2000MusbDma *d = &s->dma[ch];
+
+        if (!(d->cntl & MUSB_DMA_ENABLE) || MUSB_DMA_EP(d->cntl) != epnum) {
+            continue;
+        }
+        if (dir == 0 && (d->cntl & MUSB_DMA_DIR_TX)) {
+            if (!d->running) {
+                sf2000_musb_dma_tx_run(s, ch);
+            }
+            return true;
+        }
+        if (dir == 1 && !(d->cntl & MUSB_DMA_DIR_TX)) {
+            return sf2000_musb_dma_rx_run(s, ch);
+        }
+    }
+    return false;
+}
+
+static void sf2000_musb_dma_write(SF2000MusbState *s, hwaddr addr,
+                                  uint32_t value)
+{
+    int ch = (addr - 0x200) / 0x10;
+    SF2000MusbDma *d;
+
+    if (addr == MUSB_DMA_INTR || ch >= MUSB_DMA_CHANNELS) {
+        return;
+    }
+    d = &s->dma[ch];
+    switch (addr & 0xf) {
+    case 0x4:
+        d->cntl = value & 0xffff;
+        if (d->cntl & MUSB_DMA_ENABLE) {
+            int ep = MUSB_DMA_EP(d->cntl);
+
+            d->rqpkt = s->vendor[(MUSB_RQPKTCOUNT(ep) - 0x200) / 4];
+            if (sf2000_trace_aux()) {
+                qemu_log_mask(LOG_UNIMP, "sf2000: musb%u-dma ch%d start %s ep%d"
+                              " mode%d addr=0x%08x count=%u rqpkt=%u\n", s->id,
+                              ch, (d->cntl & MUSB_DMA_DIR_TX) ? "tx" : "rx", ep,
+                              !!(d->cntl & MUSB_DMA_MODE1), d->addr, d->count,
+                              d->rqpkt);
+            }
+            if (d->cntl & MUSB_DMA_DIR_TX) {
+                sf2000_musb_dma_tx_run(s, ch);
+            } else {
+                /* a packet may already be waiting in the FIFO */
+                sf2000_musb_dma_rx_run(s, ch);
+            }
+        }
+        break;
+    case 0x8:
+        d->addr = value;
+        break;
+    case 0xc:
+        d->count = value;
+        break;
+    default:
+        break;
+    }
+}
+
+static uint32_t sf2000_musb_dma_read(SF2000MusbState *s, hwaddr addr)
+{
+    int ch = (addr - 0x200) / 0x10;
+    uint32_t v;
+
+    if (addr == MUSB_DMA_INTR) {
+        v = s->dma_intr;                    /* read clears */
+        s->dma_intr = 0;
+        qemu_set_irq(s->dma_irq, 0);
+        return v;
+    }
+    if (ch >= MUSB_DMA_CHANNELS) {
+        return 0;
+    }
+    switch (addr & 0xf) {
+    case 0x4:
+        return s->dma[ch].cntl;
+    case 0x8:
+        return s->dma[ch].addr;
+    case 0xc:
+        return s->dma[ch].count;
+    default:
+        return 0;
+    }
+}
+
+static void sf2000_musb_src_irq(void *opaque, int src, int level)
+{
+    SF2000MusbState *s = opaque;
+    int i;
+    bool any = false;
+
+    if (src < 0 || src >= musb_irq_max) {
+        return;
+    }
+    s->src_level[src] = !!level;
+    /* set_vbus / set_session are OTG status signals, not interrupts. */
+    for (i = 0; i < musb_set_vbus; i++) {
+        any |= s->src_level[i];
+    }
+    if (sf2000_trace_aux()) {
+        qemu_log_mask(LOG_UNIMP, "sf2000: musb%u-irq src=%d level=%d mc=%d\n",
+                      s->id, src, level, any);
+    }
+    qemu_set_irq(s->mc_irq, any);
+}
+
+static uint64_t sf2000_musb_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SF2000MusbState *s = opaque;
+    uint64_t value;
+
+    if (addr < 0x200) {
+        unsigned idx = size == 1 ? 0 : (size == 2 ? 1 : 2);
+        value = musb_read[idx](s->musb, addr);
+    } else if (addr < 0x300) {
+        value = sf2000_musb_dma_read(s, addr & ~3) >> ((addr & 3) * 8);
+        if (size < 4) {
+            value &= (1u << (size * 8)) - 1u;
+        }
+    } else {
+        value = s->vendor[(addr - 0x200) >> 2] >> ((addr & 3) * 8);
+        if (size < 4) {
+            value &= (1u << (size * 8)) - 1u;
+        }
+    }
+    if (sf2000_trace_aux()) {
+        qemu_log_mask(LOG_UNIMP, "sf2000: musb%u-read off=0x%03" HWADDR_PRIx
+                      " size=%u value=0x%08" PRIx64 "\n", s->id, addr, size,
+                      value);
+    }
+    return value;
+}
+
+static void sf2000_musb_write(void *opaque, hwaddr addr, uint64_t value,
+                              unsigned size)
+{
+    SF2000MusbState *s = opaque;
+
+    if (sf2000_trace_aux()) {
+        qemu_log_mask(LOG_UNIMP, "sf2000: musb%u-write off=0x%03" HWADDR_PRIx
+                      " size=%u value=0x%08" PRIx64 "\n", s->id, addr, size,
+                      value);
+    }
+    if (addr < 0x200) {
+        unsigned idx = size == 1 ? 0 : (size == 2 ? 1 : 2);
+        musb_write[idx](s->musb, addr, value);
+    } else if (addr < 0x300) {
+        sf2000_musb_dma_write(s, addr & ~3, value);
+    } else {
+        uint32_t *slot = &s->vendor[(addr - 0x200) >> 2];
+        uint32_t mask = (size >= 4 ? 0xffffffffu : ((1u << (size * 8)) - 1u))
+                        << ((addr & 3) * 8);
+        *slot = (*slot & ~mask) | (((uint32_t)value << ((addr & 3) * 8)) & mask);
+    }
+}
+
+static const MemoryRegionOps sf2000_musb_ops = {
+    .read = sf2000_musb_read,
+    .write = sf2000_musb_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+        .unaligned = true,
+    },
+};
+
+static void sf2000_musb_realize(DeviceState *dev, Error **errp)
+{
+    SF2000MusbState *s = SF2000_MUSB(dev);
+
+    qdev_init_gpio_in(dev, sf2000_musb_src_irq, musb_irq_max);
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->mc_irq);
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->dma_irq);
+    memory_region_init_io(&s->iomem, OBJECT(dev), &sf2000_musb_ops, s,
+                          "sf2000.musb", SF2000_USB_SIZE);
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+    s->musb = musb_init(dev, 0);
+    musb_set_dma_notify(s->musb, sf2000_musb_dma_notify, s);
+}
+
+static const Property sf2000_musb_properties[] = {
+    DEFINE_PROP_UINT8("id", SF2000MusbState, id, 0),
+};
+
+static void sf2000_musb_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->realize = sf2000_musb_realize;
+    dc->desc = "HC15xx MUSB HDRC USB host";
+    device_class_set_props(dc, sf2000_musb_properties);
+}
+
+static const TypeInfo sf2000_musb_info = {
+    .name = TYPE_SF2000_MUSB,
+    .parent = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(SF2000MusbState),
+    .class_init = sf2000_musb_class_init,
+};
+
+/* INTC bank-2 line handler: opaque carries the bank-2 bit mask. */
+static void sf2000_irq2_line(void *opaque, int n, int level)
+{
+    uint32_t bit = (uint32_t)(uintptr_t)opaque;
+
+    if (level) {
+        sf2000_irq2_pending |= bit;
+    } else {
+        sf2000_irq2_pending &= ~bit;
+    }
+    if (sf2000_trace_aux()) {
+        uint32_t enable = 0;
+
+        sf2000_mmio_get32(SF2000_IRQ_ENABLE2, &enable);
+        qemu_log_mask(LOG_UNIMP, "sf2000: irq2 bit=0x%08x level=%d pending=0x%08x"
+                      " enable2=0x%08x\n", bit, level, sf2000_irq2_pending,
+                      enable);
+    }
+    sf2000_update_irq();
+}
+
+static void sf2000_create_musb(MemoryRegion *sysmem, hwaddr base,
+                               uint32_t mc_bit, uint32_t dma_bit)
+{
+    DeviceState *dev = qdev_new(TYPE_SF2000_MUSB);
+
+    qdev_prop_set_uint8(dev, "id", base == SF2000_USB0_BASE ? 0 : 1);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    memory_region_add_subregion_overlap(sysmem, base,
+        sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0), 1);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+        qemu_allocate_irq(sf2000_irq2_line, (void *)(uintptr_t)mc_bit, 0));
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 1,
+        qemu_allocate_irq(sf2000_irq2_line, (void *)(uintptr_t)dma_bit, 0));
+}
+
 static void sf2000_load_bootrom(MachineState *machine, MemoryRegion *sysmem)
 {
     const char *bios = machine->firmware;
@@ -3605,6 +4621,12 @@ static void sf2000_load_bootrom(MachineState *machine, MemoryRegion *sysmem)
         exit(1);
     }
     memcpy(sf2000_bootrom_bytes, contents, MIN((gsize)SF2000_BOOT_SIZE, len));
+    sf2000_flash_exit_notifier.notify = sf2000_flash_exit;
+    qemu_add_exit_notifier(&sf2000_flash_exit_notifier);
+    if (g_getenv("SF2000_FLASH_SAVE")) {
+        info_report("sf2000: flash writes persist to '%s'",
+                    g_getenv("SF2000_FLASH_SAVE"));
+    }
     if (len > SF2000_BL_FLASH_OFF &&
         len - SF2000_BL_FLASH_OFF <= machine->ram_size - SF2000_BL_RAM_BASE) {
         gsize bootloader_len = len - SF2000_BL_FLASH_OFF;
@@ -3683,7 +4705,7 @@ static void sf2000_seed_boot_handoff(void)
     memset(data, 0, sizeof(data));
     stl_le_p(header, SF2000_BL_INFO_MAGIC);
     stl_le_p(header + 4, SF2000_BL_INFO_DATA_KSEG1);
-    stl_le_p(data, SF2000_TVSYS_RGB_LCD);
+    stl_le_p(data, sf2000_board->tvsys);
 
     rom_add_blob_fixed("sf2000.bl-handoff.header", header, sizeof(header),
                        SF2000_BL_INFO_MAGIC_ADDR);
@@ -3720,6 +4742,12 @@ static void sf2000_init(MachineState *machine)
     if (machine->ram_size == 0) {
         machine->ram_size = SF2000_RAM_DEFAULT;
     }
+
+    sf2000_board = SF2000_MACHINE_GET_CLASS(machine)->profile;
+    info_report("sf2000: board profile '%s' chip-id 0x%08x jedec %02x %02x %02x",
+                sf2000_board->name, sf2000_board->chip_id,
+                sf2000_board->jedec_id[0], sf2000_board->jedec_id[1],
+                sf2000_board->jedec_id[2]);
 
     cpuclk = clock_new(OBJECT(machine), "cpu-refclk");
     clock_set_hz(cpuclk, sf2000_cpu_hz());
@@ -3761,12 +4789,26 @@ static void sf2000_init(MachineState *machine)
     memory_region_init_io(mmio, NULL, &sf2000_unimp_ops, NULL,
                           "sf2000.unimplemented-mmio", SF2000_MMIO_SIZE);
     memory_region_add_subregion(sysmem, SF2000_MMIO_BASE, mmio);
+    /* Chip-ID word: firmware dispatches on the halfword at 0x18800002. */
+    sf2000_mmio_set32(SF2000_MSYSIO_BASE, sf2000_board->chip_id);
 
     lcd = qdev_new(TYPE_SF2000_LCD);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(lcd), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(lcd), 0, SF2000_LCD_MMIO_BASE);
     qemu_input_handler_activate(qemu_input_handler_register(
         lcd, &sf2000_keyboard_handler));
+
+    if (sf2000_board->has_musb) {
+        /*
+         * Real MUSB host controllers on USB0/USB1: they sit on top of the
+         * generic "unimplemented" MMIO region so the vendor registers beyond
+         * the HDRC map keep the store-and-echo behaviour.
+         */
+        sf2000_create_musb(sysmem, SF2000_USB0_BASE, SF2000_USB0_MC_IRQ2,
+                           SF2000_USB0_DMA_IRQ2);
+        sf2000_create_musb(sysmem, SF2000_USB1_BASE, SF2000_USB1_MC_IRQ2,
+                           SF2000_USB1_DMA_IRQ2);
+    }
 
     sf2000_sdio_blk = blk_by_name("sd0");
     dinfo = sf2000_sdio_blk ? NULL : drive_get(IF_SD, 0, 0);
@@ -3785,11 +4827,10 @@ static void sf2000_init(MachineState *machine)
     /* MIPS reset starts from 0xbfc00000, which maps to physical 0x1fc00000. */
 }
 
-static void sf2000_machine_class_init(ObjectClass *oc, const void *data)
+static void sf2000_base_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
 
-    mc->desc = "Data Frog SF2000 / HC15xx bring-up board";
     mc->init = sf2000_init;
     mc->default_ram_size = SF2000_RAM_DEFAULT;
     mc->default_cpu_type = MIPS_CPU_TYPE_NAME("24Kc");
@@ -3798,16 +4839,48 @@ static void sf2000_machine_class_init(ObjectClass *oc, const void *data)
     mc->no_cdrom = true;
 }
 
-static const TypeInfo sf2000_machine_type = {
-    .name = MACHINE_TYPE_NAME("sf2000"),
-    .parent = TYPE_MACHINE,
-    .class_init = sf2000_machine_class_init,
+static void sf2000_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    SF2000MachineClass *smc = SF2000_MACHINE_CLASS(oc);
+
+    mc->desc = "Data Frog SF2000 / HC15xx bring-up board";
+    smc->profile = &sf2000_board_sf2000;
+}
+
+static void hccast_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    SF2000MachineClass *smc = SF2000_MACHINE_CLASS(oc);
+
+    mc->desc = "AnyCast HDMI dongle (HiChip HC15xx, hcRTOS + hccast)";
+    smc->profile = &sf2000_board_hccast;
+}
+
+static const TypeInfo sf2000_machine_types[] = {
+    {
+        .name = TYPE_SF2000_BASE_MACHINE,
+        .parent = TYPE_MACHINE,
+        .abstract = true,
+        .class_size = sizeof(SF2000MachineClass),
+        .class_init = sf2000_base_machine_class_init,
+    }, {
+        .name = MACHINE_TYPE_NAME("sf2000"),
+        .parent = TYPE_SF2000_BASE_MACHINE,
+        .class_init = sf2000_machine_class_init,
+    }, {
+        .name = MACHINE_TYPE_NAME("hccast"),
+        .parent = TYPE_SF2000_BASE_MACHINE,
+        .class_init = hccast_machine_class_init,
+    },
 };
 
 static void sf2000_register_types(void)
 {
     type_register_static(&sf2000_lcd_info);
-    type_register_static(&sf2000_machine_type);
+    type_register_static(&sf2000_musb_info);
+    type_register_static_array(sf2000_machine_types,
+                               ARRAY_SIZE(sf2000_machine_types));
 }
 
 type_init(sf2000_register_types)
