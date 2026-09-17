@@ -156,8 +156,10 @@ $(QEMU_SRC)/.fetched:
 
 patch: $(QEMU_SRC)/.patched
 
-$(QEMU_SRC)/.patched: $(QEMU_SRC)/.fetched patches/qemu-$(QEMU_VERSION)/0001-hw-mips-add-sf2000-machine.patch $(SF2000_QEMU_SRC)
+$(QEMU_SRC)/.patched: $(QEMU_SRC)/.fetched $(wildcard patches/qemu-$(QEMU_VERSION)/*.patch) $(SF2000_QEMU_SRC)
 	cd $(QEMU_SRC) && { test -f hw/mips/sf2000.c || patch -p1 < ../../patches/qemu-$(QEMU_VERSION)/0001-hw-mips-add-sf2000-machine.patch; }
+	cd $(QEMU_SRC) && for p in ../../patches/qemu-$(QEMU_VERSION)/000[2-9]-*.patch; do \
+		stamp=.applied-$$(basename $$p .patch); test -f $$stamp || { patch -p1 < $$p && touch $$stamp; }; done
 	cp $(SF2000_QEMU_SRC) $(QEMU_SRC)/hw/mips/sf2000.c
 	touch $@
 
